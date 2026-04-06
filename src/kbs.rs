@@ -1,0 +1,316 @@
+/// KBS resource fetch and per-path caching.
+///
+/// Ports Python's KBS resource handling: cache read/write with per-path TTL,
+/// bearer token authentication, and error caching.
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::time::Instant;
+
+use crate::attestation::fetch_kbs_bearer_token;
+use crate::ownership::utc_now;
+
+pub struct KbsCacheEntry {
+    pub body: Vec<u8>,
+    pub content_type: String,
+    pub status: u16,
+    pub expires_at: Instant,
+    pub error: Option<Value>,
+    pub error_until: Instant,
+}
+
+impl KbsCacheEntry {
+    /// Returns true if the cache entry has valid (non-expired) content.
+    pub fn is_valid(&self) -> bool {
+        Instant::now() < self.expires_at && !self.body.is_empty()
+    }
+
+    /// Returns true if there is a cached error that hasn't expired.
+    pub fn has_valid_error(&self) -> bool {
+        self.error.is_some() && Instant::now() < self.error_until
+    }
+}
+
+/// Check cache for a resource entry. Returns (entry_body_data, error_payload).
+/// Both None means cache miss.
+fn cached_resource_entry(
+    cache: &mut std::collections::HashMap<String, KbsCacheEntry>,
+    cache_key: &str,
+) -> (Option<(Vec<u8>, String, u16)>, Option<Value>) {
+    if let Some(entry) = cache.get(cache_key) {
+        if entry.is_valid() {
+            return (
+                Some((entry.body.clone(), entry.content_type.clone(), entry.status)),
+                None,
+            );
+        }
+        if entry.has_valid_error() {
+            return (None, entry.error.clone());
+        }
+        // Expired -- remove
+        cache.remove(cache_key);
+    }
+    (None, None)
+}
+
+/// Store a successful resource fetch in the cache.
+fn store_resource_success(
+    cache: &mut std::collections::HashMap<String, KbsCacheEntry>,
+    cache_key: &str,
+    body: Vec<u8>,
+    content_type: String,
+    status: u16,
+    cache_seconds: f64,
+) {
+    let ttl = cache_seconds.max(0.0);
+    if ttl <= 0.0 {
+        cache.remove(cache_key);
+        return;
+    }
+    cache.insert(
+        cache_key.to_string(),
+        KbsCacheEntry {
+            body,
+            content_type,
+            status,
+            expires_at: Instant::now() + Duration::from_secs_f64(ttl),
+            error: None,
+            error_until: Instant::now(),
+        },
+    );
+}
+
+/// Store an error for a resource fetch in the cache.
+fn store_resource_error(
+    cache: &mut std::collections::HashMap<String, KbsCacheEntry>,
+    cache_key: &str,
+    error_payload: Value,
+    failure_cache_seconds: f64,
+) {
+    let ttl = failure_cache_seconds.max(0.0);
+    if ttl <= 0.0 {
+        cache.remove(cache_key);
+        return;
+    }
+    cache.insert(
+        cache_key.to_string(),
+        KbsCacheEntry {
+            body: Vec::new(),
+            content_type: String::new(),
+            status: 0,
+            expires_at: Instant::now(),
+            error: Some(error_payload),
+            error_until: Instant::now() + Duration::from_secs_f64(ttl),
+        },
+    );
+}
+
+/// Fetch a KBS resource by path.
+/// Holds the write lock across the entire fetch (matching Python's RESOURCE_FETCH_LOCK).
+/// Returns Ok((body, content_type, status)) or Err((http_status, error_json)).
+pub async fn fetch_kbs_resource(
+    state: &crate::AppState,
+    cache_key: &str,
+) -> Result<(Vec<u8>, String, u16), (u16, Value)> {
+    let mut cache = state.kbs_resource_cache.write().await;
+
+    // Check cache first
+    let (cached_success, cached_error) = cached_resource_entry(&mut cache, cache_key);
+    if let Some((body, content_type, status)) = cached_success {
+        return Ok((body, content_type, status));
+    }
+    if let Some(error) = cached_error {
+        return Err((502, error));
+    }
+
+    // Get bearer token
+    let token = match fetch_kbs_bearer_token(state).await {
+        Ok(t) => t,
+        Err(e) => {
+            let error_payload = json!({
+                "error": "kbs_token_unavailable",
+                "detail": e,
+                "timestamp": utc_now(),
+            });
+            store_resource_error(
+                &mut cache,
+                cache_key,
+                error_payload.clone(),
+                state.config.kbs_resource_failure_cache_seconds,
+            );
+            return Err((502, error_payload));
+        }
+    };
+
+    let resource_url = format!(
+        "{}/{}",
+        state.config.kbs_resource_url.trim_end_matches('/'),
+        cache_key
+    );
+
+    let result = state
+        .http_client
+        .get(&resource_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/octet-stream")
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) => {
+            let upstream_status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            if upstream_status != 200 {
+                let error_body = resp
+                    .text()
+                    .await
+                    .unwrap_or_default();
+                let error_payload = json!({
+                    "error": "kbs_resource_non_200",
+                    "upstream_status": upstream_status,
+                    "upstream_body": error_body,
+                    "resource_url": resource_url,
+                    "timestamp": utc_now(),
+                });
+                store_resource_error(
+                    &mut cache,
+                    cache_key,
+                    error_payload.clone(),
+                    state.config.kbs_resource_failure_cache_seconds,
+                );
+                return Err((502, error_payload));
+            }
+
+            match resp.bytes().await {
+                Ok(body) => {
+                    let body_vec = body.to_vec();
+                    store_resource_success(
+                        &mut cache,
+                        cache_key,
+                        body_vec.clone(),
+                        content_type.clone(),
+                        200,
+                        state.config.kbs_resource_cache_seconds,
+                    );
+                    Ok((body_vec, content_type, 200))
+                }
+                Err(e) => {
+                    let error_payload = json!({
+                        "error": "kbs_resource_http_error",
+                        "detail": e.to_string(),
+                        "resource_url": resource_url,
+                        "timestamp": utc_now(),
+                    });
+                    store_resource_error(
+                        &mut cache,
+                        cache_key,
+                        error_payload.clone(),
+                        state.config.kbs_resource_failure_cache_seconds,
+                    );
+                    Err((502, error_payload))
+                }
+            }
+        }
+        Err(e) => {
+            // Check if it's an HTTP error (status code available) vs connection error
+            let (error_type, upstream_status, upstream_body) = if e.is_status() {
+                let status = e.status().map(|s| s.as_u16());
+                (
+                    "kbs_resource_http_error",
+                    status,
+                    Some(e.to_string()),
+                )
+            } else {
+                ("kbs_resource_unreachable", None, None)
+            };
+
+            let mut error_payload = json!({
+                "error": error_type,
+                "detail": e.to_string(),
+                "resource_url": resource_url,
+                "timestamp": utc_now(),
+            });
+            if let Some(status) = upstream_status {
+                error_payload["upstream_status"] = json!(status);
+            }
+            if let Some(body) = upstream_body {
+                error_payload["upstream_body"] = json!(body);
+            }
+            store_resource_error(
+                &mut cache,
+                cache_key,
+                error_payload.clone(),
+                state.config.kbs_resource_failure_cache_seconds,
+            );
+            Err((502, error_payload))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_entry_valid() {
+        let entry = KbsCacheEntry {
+            body: vec![1, 2, 3],
+            content_type: "application/octet-stream".to_string(),
+            status: 200,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            error: None,
+            error_until: Instant::now(),
+        };
+        assert!(entry.is_valid());
+        assert!(!entry.has_valid_error());
+    }
+
+    #[test]
+    fn test_cache_entry_expired() {
+        let entry = KbsCacheEntry {
+            body: vec![1, 2, 3],
+            content_type: "application/octet-stream".to_string(),
+            status: 200,
+            // Already expired (in the past)
+            expires_at: Instant::now() - Duration::from_secs(1),
+            error: None,
+            error_until: Instant::now(),
+        };
+        assert!(!entry.is_valid());
+    }
+
+    #[test]
+    fn test_cache_entry_with_error() {
+        let entry = KbsCacheEntry {
+            body: Vec::new(),
+            content_type: String::new(),
+            status: 0,
+            expires_at: Instant::now(),
+            error: Some(json!({"error": "test_error"})),
+            error_until: Instant::now() + Duration::from_secs(60),
+        };
+        assert!(!entry.is_valid());
+        assert!(entry.has_valid_error());
+    }
+
+    #[test]
+    fn test_cache_entry_expired_error() {
+        let entry = KbsCacheEntry {
+            body: Vec::new(),
+            content_type: String::new(),
+            status: 0,
+            expires_at: Instant::now(),
+            error: Some(json!({"error": "test_error"})),
+            error_until: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(!entry.is_valid());
+        assert!(!entry.has_valid_error());
+    }
+}
