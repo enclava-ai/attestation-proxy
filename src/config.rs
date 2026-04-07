@@ -37,6 +37,7 @@ pub struct Config {
     pub owner_escrow_secret_name: String,
     pub owner_escrow_encrypted_key: String,
     pub owner_escrow_sealed_key: String,
+    pub owner_escrow_dir: String,
     pub ownership_challenge_ttl_seconds: u64,
     pub k8s_api_url: String,
     pub k8s_service_account_token_path: String,
@@ -158,6 +159,7 @@ impl Config {
             owner_escrow_secret_name,
             owner_escrow_encrypted_key: env_or("OWNER_ESCROW_ENCRYPTED_KEY", "seed-encrypted"),
             owner_escrow_sealed_key: env_or("OWNER_ESCROW_SEALED_KEY", "seed-sealed"),
+            owner_escrow_dir: env_or("OWNER_ESCROW_DIR", "/owner-escrow"),
             ownership_challenge_ttl_seconds: env_u64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
             k8s_service_account_token_path: env_or(
@@ -211,6 +213,7 @@ impl Config {
             owner_escrow_secret_name: "".into(),
             owner_escrow_encrypted_key: "seed-encrypted".into(),
             owner_escrow_sealed_key: "seed-sealed".into(),
+            owner_escrow_dir: "/owner-escrow".into(),
             ownership_challenge_ttl_seconds: 300,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_service_account_token_path:
@@ -264,6 +267,7 @@ mod tests {
         "OWNER_ESCROW_SECRET_NAME",
         "OWNER_ESCROW_ENCRYPTED_KEY",
         "OWNER_ESCROW_SEALED_KEY",
+        "OWNER_ESCROW_DIR",
         "OWNERSHIP_CHALLENGE_TTL_SECONDS",
         "K8S_API_URL",
         "K8S_SERVICE_ACCOUNT_TOKEN_PATH",
@@ -327,6 +331,7 @@ mod tests {
         assert_eq!(config.owner_escrow_secret_name, "");
         assert_eq!(config.owner_escrow_encrypted_key, "seed-encrypted");
         assert_eq!(config.owner_escrow_sealed_key, "seed-sealed");
+        assert_eq!(config.owner_escrow_dir, "/owner-escrow");
         assert_eq!(config.ownership_challenge_ttl_seconds, 300);
         assert_eq!(config.k8s_api_url, "https://kubernetes.default.svc");
     }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -42,6 +43,56 @@ struct SecretObject {
 
 fn default_secret_type() -> String {
     "Opaque".to_string()
+}
+
+fn owner_escrow_dir(config: &crate::config::Config) -> PathBuf {
+    PathBuf::from(&config.owner_escrow_dir)
+}
+
+fn ensure_owner_escrow_dir(config: &crate::config::Config) -> Result<PathBuf, OwnershipError> {
+    let dir = owner_escrow_dir(config);
+    let metadata = fs::metadata(&dir)
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_dir_unavailable:{err}")))?;
+    if !metadata.is_dir() {
+        return Err(OwnershipError::Store(
+            "owner_escrow_dir_not_directory".to_string(),
+        ));
+    }
+    Ok(dir)
+}
+
+fn owner_escrow_file_path(
+    config: &crate::config::Config,
+    key: &str,
+) -> Result<PathBuf, OwnershipError> {
+    let dir = ensure_owner_escrow_dir(config)?;
+    if key.contains('/') || key.contains('\\') || key == "." || key == ".." {
+        return Err(OwnershipError::Store(format!(
+            "owner_escrow_key_invalid:{key}"
+        )));
+    }
+    Ok(dir.join(key))
+}
+
+fn read_optional_file(path: &Path, key: &str) -> Result<Option<Vec<u8>>, OwnershipError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(OwnershipError::Store(format!(
+            "owner_escrow_read_failed:{key}:{err}"
+        ))),
+    }
+}
+
+fn write_atomic(path: &Path, key: &str, bytes: &[u8]) -> Result<(), OwnershipError> {
+    let mut tmp_path = path.to_path_buf();
+    tmp_path.set_extension("tmp");
+    fs::write(&tmp_path, bytes).map_err(|err| {
+        OwnershipError::Store(format!("owner_escrow_write_failed:{key}:{err}"))
+    })?;
+    fs::rename(&tmp_path, path).map_err(|err| {
+        OwnershipError::Store(format!("owner_escrow_rename_failed:{key}:{err}"))
+    })
 }
 
 fn build_kube_client(config: &crate::config::Config) -> Result<reqwest::Client, OwnershipError> {
@@ -175,6 +226,22 @@ pub async fn load_owner_seed_material(
     })
 }
 
+pub async fn load_owner_seed_material_from_files(
+    state: &crate::AppState,
+) -> Result<OwnerSeedMaterial, OwnershipError> {
+    let encrypted_path =
+        owner_escrow_file_path(&state.config, &state.config.owner_escrow_encrypted_key)?;
+    let sealed_path =
+        owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
+    Ok(OwnerSeedMaterial {
+        encrypted: read_optional_file(
+            &encrypted_path,
+            &state.config.owner_escrow_encrypted_key,
+        )?,
+        sealed: read_optional_file(&sealed_path, &state.config.owner_escrow_sealed_key)?,
+    })
+}
+
 pub async fn update_owner_seed_material(
     state: &crate::AppState,
     encrypted: EscrowValueUpdate<'_>,
@@ -209,4 +276,53 @@ pub async fn update_owner_seed_material(
     }
 
     put_secret(state, &secret).await
+}
+
+pub async fn update_owner_seed_material_from_files(
+    state: &crate::AppState,
+    encrypted: EscrowValueUpdate<'_>,
+    sealed: EscrowValueUpdate<'_>,
+) -> Result<(), OwnershipError> {
+    let encrypted_path =
+        owner_escrow_file_path(&state.config, &state.config.owner_escrow_encrypted_key)?;
+    let sealed_path =
+        owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
+
+    match encrypted {
+        EscrowValueUpdate::Keep => {}
+        EscrowValueUpdate::Remove => {
+            if let Err(err) = fs::remove_file(&encrypted_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(OwnershipError::Store(format!(
+                        "owner_escrow_remove_failed:{}:{err}",
+                        state.config.owner_escrow_encrypted_key
+                    )));
+                }
+            }
+        }
+        EscrowValueUpdate::Set(bytes) => write_atomic(
+            &encrypted_path,
+            &state.config.owner_escrow_encrypted_key,
+            bytes,
+        )?,
+    }
+
+    match sealed {
+        EscrowValueUpdate::Keep => {}
+        EscrowValueUpdate::Remove => {
+            if let Err(err) = fs::remove_file(&sealed_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(OwnershipError::Store(format!(
+                        "owner_escrow_remove_failed:{}:{err}",
+                        state.config.owner_escrow_sealed_key
+                    )));
+                }
+            }
+        }
+        EscrowValueUpdate::Set(bytes) => {
+            write_atomic(&sealed_path, &state.config.owner_escrow_sealed_key, bytes)?
+        }
+    }
+
+    Ok(())
 }

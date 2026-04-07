@@ -284,6 +284,7 @@ fn validate_bootstrap_signature(
 
 async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial, OwnershipError> {
     match state.config.owner_ciphertext_backend.as_str() {
+        "filesystem" => escrow::load_owner_seed_material_from_files(state).await,
         "kubernetes-secret" => escrow::load_owner_seed_material(state).await,
         "kbs-resource" => {
             let encrypted = match kbs::fetch_kbs_resource(
@@ -350,6 +351,9 @@ async fn update_owner_seed_material(
     sealed: EscrowValueUpdate<'_>,
 ) -> Result<(), OwnershipError> {
     match state.config.owner_ciphertext_backend.as_str() {
+        "filesystem" => {
+            escrow::update_owner_seed_material_from_files(state, encrypted, sealed).await
+        }
         "kubernetes-secret" => escrow::update_owner_seed_material(state, encrypted, sealed).await,
         "kbs-resource" => Err(OwnershipError::Store(
             "kbs_resource_backend_is_read_only".to_string(),
