@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -87,12 +88,31 @@ fn read_optional_file(path: &Path, key: &str) -> Result<Option<Vec<u8>>, Ownersh
 fn write_atomic(path: &Path, key: &str, bytes: &[u8]) -> Result<(), OwnershipError> {
     let mut tmp_path = path.to_path_buf();
     tmp_path.set_extension("tmp");
-    fs::write(&tmp_path, bytes).map_err(|err| {
-        OwnershipError::Store(format!("owner_escrow_write_failed:{key}:{err}"))
-    })?;
+    let mut tmp_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_write_failed:{key}:{err}")))?;
+    tmp_file
+        .write_all(bytes)
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_write_failed:{key}:{err}")))?;
+    tmp_file
+        .sync_all()
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_sync_failed:{key}:{err}")))?;
     fs::rename(&tmp_path, path).map_err(|err| {
         OwnershipError::Store(format!("owner_escrow_rename_failed:{key}:{err}"))
-    })
+    })?;
+    sync_parent_dir(path, key)
+}
+
+fn sync_parent_dir(path: &Path, key: &str) -> Result<(), OwnershipError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| OwnershipError::Store(format!("owner_escrow_parent_missing:{key}")))?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_parent_sync_failed:{key}:{err}")))
 }
 
 fn build_kube_client(config: &crate::config::Config) -> Result<reqwest::Client, OwnershipError> {
@@ -298,6 +318,11 @@ pub async fn update_owner_seed_material_from_files(
                         state.config.owner_escrow_encrypted_key
                     )));
                 }
+            } else {
+                sync_parent_dir(
+                    &encrypted_path,
+                    &state.config.owner_escrow_encrypted_key,
+                )?;
             }
         }
         EscrowValueUpdate::Set(bytes) => write_atomic(
@@ -317,6 +342,8 @@ pub async fn update_owner_seed_material_from_files(
                         state.config.owner_escrow_sealed_key
                     )));
                 }
+            } else {
+                sync_parent_dir(&sealed_path, &state.config.owner_escrow_sealed_key)?;
             }
         }
         EscrowValueUpdate::Set(bytes) => {
