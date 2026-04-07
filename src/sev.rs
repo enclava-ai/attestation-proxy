@@ -127,7 +127,7 @@ pub fn derive_measurement_policy_key() -> Result<[u8; 32], String> {
         exitinfo2: 0,
     };
 
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), SNP_GET_DERIVED_KEY, &mut guest_req) };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), SNP_GET_DERIVED_KEY as _, &mut guest_req) };
     if rc != 0 {
         return Err(format!("sev_guest_ioctl_failed:{}", io::Error::last_os_error()));
     }
