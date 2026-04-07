@@ -49,10 +49,9 @@ pub fn parse_jwt_payload(token: &str) -> Option<Value> {
     // base64url decode with padding
     let padded = pad_b64(payload_part);
     let decoded = URL_SAFE_NO_PAD
-        .decode(&padded)
+        .decode(payload_part.as_bytes())
         .or_else(|_| {
-            // Try with standard padding via the padded approach
-            base64::engine::general_purpose::URL_SAFE.decode(payload_part)
+            base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes())
         })
         .ok()?;
     let text = std::str::from_utf8(&decoded).ok()?;
@@ -507,6 +506,69 @@ pub fn extract_init_data_hash(claims: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_init_data_claim_field(claims: &Value, field: &str) -> Option<String> {
+    let dynamic_paths = [
+        vec!["init_data_claims", "identity", field],
+        vec!["init_data_claims", field],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "init_data_claims",
+            "identity",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "init_data_claims",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data_claims",
+            "identity",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data_claims",
+            field,
+        ],
+    ];
+
+    for parts in dynamic_paths {
+        if let Some(val) = path_get(claims, &parts) {
+            if let Some(s) = val.as_str() {
+                if !s.trim().is_empty() {
+                    return Some(s.trim().to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn extract_bootstrap_owner_pubkey_hash(claims: &Value) -> Option<String> {
+    extract_init_data_claim_field(claims, "bootstrap_owner_pubkey_hash")
+}
+
+pub fn extract_tenant_instance_identity_hash(claims: &Value) -> Option<String> {
+    extract_init_data_claim_field(claims, "tenant_instance_identity_hash")
+}
+
+pub fn extract_tenant_id(claims: &Value) -> Option<String> {
+    extract_init_data_claim_field(claims, "tenant_id")
+}
+
+pub fn extract_instance_id(claims: &Value) -> Option<String> {
+    extract_init_data_claim_field(claims, "instance_id")
 }
 
 /// Extract measurement from claims.

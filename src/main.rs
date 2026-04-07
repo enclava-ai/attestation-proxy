@@ -1,12 +1,3 @@
-mod attestation;
-mod config;
-mod handlers;
-mod kbs;
-mod ownership;
-
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request};
@@ -14,21 +5,14 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use attestation_proxy::attestation::AaTokenCache;
+use attestation_proxy::config::Config;
+use attestation_proxy::handlers;
+use attestation_proxy::ownership::OwnershipGuard;
+use attestation_proxy::AppState;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
-
-use attestation::AaTokenCache;
-use config::Config;
-use kbs::KbsCacheEntry;
-use ownership::OwnershipGuard;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<Config>,
-    pub http_client: reqwest::Client,
-    pub aa_token_cache: Arc<RwLock<AaTokenCache>>,
-    pub kbs_resource_cache: Arc<RwLock<HashMap<String, KbsCacheEntry>>>,
-    pub ownership: Arc<OwnershipGuard>,
-}
 
 /// Ownership gate middleware: blocks non-allowed paths with 423 in level1 mode.
 async fn ownership_gate(
@@ -66,7 +50,11 @@ async fn main() {
         http_client: reqwest::Client::new(),
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
+        bootstrap_challenge: Arc::new(Mutex::new(None)),
     };
+
+    handlers::initialize_ownership_state(&state).await;
+    handlers::spawn_auto_unlock_if_needed(state.clone());
 
     let app = Router::new()
         .route("/health", get(handlers::health))
@@ -74,9 +62,35 @@ async fn main() {
         .route("/.well-known/confidential/status", get(handlers::status))
         .route("/v1/attestation/info", get(handlers::attestation_info))
         .route("/v1/attestation", get(handlers::attestation))
+        .route("/.well-known/confidential/attestation", get(handlers::attestation))
         .route("/cdh/resource/{*path}", get(handlers::cdh_resource))
         .route("/unlock", post(handlers::unlock))
         .route("/.well-known/confidential/unlock", post(handlers::unlock))
+        .route("/change-password", post(handlers::change_password))
+        .route(
+            "/.well-known/confidential/change-password",
+            post(handlers::change_password),
+        )
+        .route("/recover", post(handlers::recover))
+        .route("/.well-known/confidential/recover", post(handlers::recover))
+        .route("/enable-auto-unlock", post(handlers::enable_auto_unlock))
+        .route(
+            "/.well-known/confidential/enable-auto-unlock",
+            post(handlers::enable_auto_unlock),
+        )
+        .route("/disable-auto-unlock", post(handlers::disable_auto_unlock))
+        .route(
+            "/.well-known/confidential/disable-auto-unlock",
+            post(handlers::disable_auto_unlock),
+        )
+        .route(
+            "/.well-known/confidential/bootstrap/challenge",
+            post(handlers::bootstrap_challenge),
+        )
+        .route(
+            "/.well-known/confidential/bootstrap/claim",
+            post(handlers::bootstrap_claim),
+        )
         .fallback(handlers::not_found)
         .layer(middleware::from_fn_with_state(state.clone(), ownership_gate))
         .with_state(state);
@@ -89,7 +103,7 @@ async fn main() {
 #[cfg(test)]
 mod main {
     mod tests {
-        use crate::ownership::OwnershipGuard;
+        use attestation_proxy::ownership::OwnershipGuard;
 
         #[test]
         fn ownership_gate_state_behavior() {

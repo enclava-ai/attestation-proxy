@@ -8,13 +8,22 @@ use axum::http::{header, Response as HttpResponse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rand::RngCore;
 use serde_json::{json, Value};
+use sha2::Digest;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::attestation;
+use crate::escrow::{self, EscrowValueUpdate, OwnerSeedMaterial};
 use crate::kbs;
 use crate::ownership::utc_now;
-use crate::ownership::{OwnershipError, HandoffOutcome};
+use crate::ownership::{
+    BootstrapChallenge, HandoffOutcome, OwnershipError, SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
+};
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +38,26 @@ pub struct AttestationQuery {
 
 #[derive(serde::Deserialize)]
 pub struct UnlockRequest {
+    pub password: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RecoverRequest {
+    pub mnemonic: String,
+    pub new_password: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct BootstrapClaimRequest {
+    pub challenge: String,
+    pub bootstrap_pubkey: String,
+    pub signature: String,
     pub password: String,
 }
 
@@ -160,6 +189,177 @@ fn build_server_verification(
     })
 }
 
+#[derive(Default)]
+struct OwnershipIdentity {
+    tenant_id: Option<String>,
+    instance_id: Option<String>,
+    bootstrap_owner_pubkey_hash: Option<String>,
+    tenant_instance_identity_hash: Option<String>,
+    claims_error: Option<String>,
+}
+
+async fn fetch_ownership_identity(state: &AppState) -> OwnershipIdentity {
+    let token_claims = attestation::fetch_kbs_token_claims(state).await;
+    let error = token_claims
+        .get("error")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let claims = token_claims
+        .get("claims_root")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    OwnershipIdentity {
+        tenant_id: attestation::extract_tenant_id(&claims),
+        instance_id: attestation::extract_instance_id(&claims),
+        bootstrap_owner_pubkey_hash: attestation::extract_bootstrap_owner_pubkey_hash(&claims),
+        tenant_instance_identity_hash: attestation::extract_tenant_instance_identity_hash(&claims),
+        claims_error: error,
+    }
+}
+
+fn decode_binary_field(value: &str) -> Result<Vec<u8>, OwnershipError> {
+    let trimmed = value.trim();
+    let decode_hex = || -> Result<Vec<u8>, OwnershipError> {
+        if trimmed.len() % 2 != 0 {
+            return Err(OwnershipError::Envelope(
+                "binary_decode_failed:hex_length_invalid".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(trimmed.len() / 2);
+        let bytes = trimmed.as_bytes();
+        for idx in (0..bytes.len()).step_by(2) {
+            let pair = std::str::from_utf8(&bytes[idx..idx + 2])
+                .map_err(|err| OwnershipError::Envelope(format!("binary_decode_failed:{err}")))?;
+            let value = u8::from_str_radix(pair, 16)
+                .map_err(|err| OwnershipError::Envelope(format!("binary_decode_failed:{err}")))?;
+            out.push(value);
+        }
+        Ok(out)
+    };
+    URL_SAFE_NO_PAD
+        .decode(trimmed.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(trimmed.as_bytes()))
+        .map_err(|_| OwnershipError::Envelope("binary_decode_failed".to_string()))
+        .or_else(|_| decode_hex())
+}
+
+fn bootstrap_pubkey_hash_matches(expected: &str, raw_pubkey: &[u8]) -> bool {
+    let expected = expected.trim();
+    let digest = sha2::Sha256::digest(raw_pubkey);
+    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let b64url = URL_SAFE_NO_PAD.encode(digest);
+    expected.eq_ignore_ascii_case(&hex) || expected == b64url
+}
+
+fn validate_bootstrap_signature(
+    challenge_b64: &str,
+    bootstrap_pubkey: &str,
+    signature: &str,
+    expected_pubkey_hash: &str,
+) -> Result<(), OwnershipError> {
+    let challenge = decode_binary_field(challenge_b64)?;
+    let public_key_bytes = decode_binary_field(bootstrap_pubkey)?;
+    let signature_bytes = decode_binary_field(signature)?;
+
+    if !bootstrap_pubkey_hash_matches(expected_pubkey_hash, &public_key_bytes) {
+        return Err(OwnershipError::Envelope(
+            "bootstrap_pubkey_hash_mismatch".to_string(),
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(
+        &public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| OwnershipError::Envelope("bootstrap_pubkey_length_invalid".to_string()))?,
+    )
+    .map_err(|err| OwnershipError::Envelope(format!("bootstrap_pubkey_invalid:{err}")))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|err| OwnershipError::Envelope(format!("bootstrap_signature_invalid:{err}")))?;
+    verifying_key
+        .verify(&challenge, &signature)
+        .map_err(|_| OwnershipError::Envelope("bootstrap_signature_mismatch".to_string()))
+}
+
+async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial, OwnershipError> {
+    match state.config.owner_ciphertext_backend.as_str() {
+        "kubernetes-secret" => escrow::load_owner_seed_material(state).await,
+        "kbs-resource" => {
+            let encrypted = match kbs::fetch_kbs_resource(
+                state,
+                state.config.owner_seed_encrypted_kbs_path.trim(),
+            )
+            .await
+            {
+                Ok((body, _, _)) => Some(body),
+                Err((_status, error_json))
+                    if error_json
+                        .get("upstream_status")
+                        .and_then(Value::as_u64)
+                        == Some(404) =>
+                {
+                    None
+                }
+                Err((_status, error_json)) => {
+                    return Err(OwnershipError::OwnerSeedUnavailable(
+                        error_json
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("owner_seed_fetch_failed")
+                            .to_string(),
+                    ))
+                }
+            };
+            let sealed = match kbs::fetch_kbs_resource(
+                state,
+                state.config.owner_seed_sealed_kbs_path.trim(),
+            )
+            .await
+            {
+                Ok((body, _, _)) => Some(body),
+                Err((_status, error_json))
+                    if error_json
+                        .get("upstream_status")
+                        .and_then(Value::as_u64)
+                        == Some(404) =>
+                {
+                    None
+                }
+                Err((_status, error_json)) => {
+                    return Err(OwnershipError::OwnerSeedUnavailable(
+                        error_json
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("owner_seed_fetch_failed")
+                            .to_string(),
+                    ))
+                }
+            };
+            Ok(OwnerSeedMaterial { encrypted, sealed })
+        }
+        other => Err(OwnershipError::Store(format!(
+            "unsupported_owner_ciphertext_backend:{other}"
+        ))),
+    }
+}
+
+async fn update_owner_seed_material(
+    state: &AppState,
+    encrypted: EscrowValueUpdate<'_>,
+    sealed: EscrowValueUpdate<'_>,
+) -> Result<(), OwnershipError> {
+    match state.config.owner_ciphertext_backend.as_str() {
+        "kubernetes-secret" => escrow::update_owner_seed_material(state, encrypted, sealed).await,
+        "kbs-resource" => Err(OwnershipError::Store(
+            "kbs_resource_backend_is_read_only".to_string(),
+        )),
+        other => Err(OwnershipError::Store(format!(
+            "unsupported_owner_ciphertext_backend:{other}"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -172,10 +372,18 @@ pub async fn health(State(state): State<AppState>) -> Response {
 
 /// GET /status, GET /.well-known/confidential/status
 pub async fn status(State(state): State<AppState>) -> Response {
-    if !state.ownership.is_level1() {
+    if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    let body = state.ownership.state_json();
+    let mut body = state.ownership.state_json();
+    let identity = fetch_ownership_identity(&state).await;
+    body["instance_id"] = json!(state.config.instance_id);
+    body["ciphertext_backend"] = json!(state.config.owner_ciphertext_backend);
+    body["tenant_id"] = json!(identity.tenant_id);
+    body["claims_instance_id"] = json!(identity.instance_id);
+    body["bootstrap_owner_pubkey_hash"] = json!(identity.bootstrap_owner_pubkey_hash);
+    body["tenant_instance_identity_hash"] = json!(identity.tenant_instance_identity_hash);
+    body["claims_error"] = json!(identity.claims_error);
     json_response(200, &body)
 }
 
@@ -451,6 +659,77 @@ pub async fn cdh_resource(
     }
 }
 
+pub async fn initialize_ownership_state(state: &AppState) {
+    if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
+        return;
+    }
+
+    match load_owner_seed_material(state).await {
+        Ok(material) => {
+            let claimed = material.encrypted.is_some();
+            state
+                .ownership
+                .set_auto_unlock_enabled(material.sealed.is_some());
+            if claimed {
+                if state.ownership.is_auto_unlock_mode() && material.sealed.is_some() {
+                    state.ownership.set_unlocking();
+                } else {
+                    state.ownership.set_locked();
+                }
+            } else {
+                state.ownership.set_unclaimed();
+            }
+        }
+        Err(err) => state.ownership.set_error(err.to_string()),
+    }
+}
+
+pub fn spawn_auto_unlock_if_needed(state: AppState) {
+    if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        // Delay SEV ioctls until the AA token path has completed at least once.
+        let _ = attestation::fetch_kbs_token_claims(&state).await;
+        let material = match load_owner_seed_material(&state).await {
+            Ok(material) => material,
+            Err(err) => {
+                state.ownership.set_error(err.to_string());
+                return;
+            }
+        };
+        let sealed = match material.sealed {
+            Some(sealed) => sealed,
+            None => {
+                state.ownership.set_locked();
+                return;
+            }
+        };
+        let wrap_key = match state
+            .ownership
+            .derive_sealing_wrap_key(&state.config.instance_id)
+        {
+            Ok(key) => Zeroizing::new(key),
+            Err(_) => {
+                state.ownership.set_locked();
+                return;
+            }
+        };
+        let owner_seed = match state.ownership.decrypt_owner_seed(&sealed, &wrap_key) {
+            Ok(seed) => Zeroizing::new(seed),
+            Err(_) => {
+                state.ownership.set_locked();
+                return;
+            }
+        };
+
+        if let Err(err) = unlock_owner_seed_material(&state, &owner_seed).await {
+            state.ownership.set_error(err.to_string());
+        }
+    });
+}
+
 /// POST /unlock, POST /.well-known/confidential/unlock.
 pub async fn unlock(
     State(state): State<AppState>,
@@ -458,8 +737,11 @@ pub async fn unlock(
 ) -> Response {
     let mut password = Zeroizing::new(payload.password.into_bytes());
 
-    if !state.ownership.is_level1() {
+    if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
+    }
+    if state.ownership.is_unclaimed() {
+        return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
     }
 
     if password.is_empty() {
@@ -496,9 +778,20 @@ pub async fn unlock(
         );
     }
 
+    if state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode() {
+        unlock_password_mode(&state, &mut password).await
+    } else {
+        unlock_level1_mode(&state, &mut password)
+    }
+}
+
+fn unlock_level1_mode(
+    state: &AppState,
+    password: &mut Zeroizing<Vec<u8>>,
+) -> Response {
     let key = match state
         .ownership
-        .derive_luks_key(&mut password, &state.config.instance_id)
+        .derive_luks_key(password, &state.config.instance_id)
     {
         Ok(key) => Zeroizing::new(key),
         Err(err) => {
@@ -532,6 +825,84 @@ pub async fn unlock(
         }
     };
 
+    render_level1_handoff_outcome(state, outcome)
+}
+
+async fn unlock_password_mode(
+    state: &AppState,
+    password: &mut Zeroizing<Vec<u8>>,
+) -> Response {
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            return json_response(
+                500,
+                &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
+            );
+        }
+    };
+
+    let owner_seed_resource = match load_owner_seed_material(state).await {
+        Ok(material) => match material.encrypted {
+            Some(resource) => resource,
+            None => {
+                state.ownership.set_unclaimed();
+                return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
+            }
+        },
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            return json_response(
+                500,
+                &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
+            );
+        }
+    };
+
+    let owner_seed = match state
+        .ownership
+        .decrypt_owner_seed(&owner_seed_resource, &wrap_key)
+    {
+        Ok(owner_seed) => Zeroizing::new(owner_seed),
+        Err(OwnershipError::WrongPassword) => {
+            state.ownership.set_locked_after_retry();
+            return json_response(200, &json!({"error": "wrong_password", "state": "locked"}));
+        }
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            return json_response(
+                500,
+                &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
+            );
+        }
+    };
+
+    match unlock_owner_seed_material(state, &owner_seed).await {
+        Ok(None) => json_response(200, &json!({"state": "unlocked"})),
+        Ok(Some(warning)) => json_response(200, &json!({"state": "unlocked", "warning": warning})),
+        Err(OwnershipError::WrongPassword) => {
+            state.ownership.set_locked_after_retry();
+            json_response(200, &json!({"error": "wrong_password", "state": "locked"}))
+        }
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            let detail = match &err {
+                OwnershipError::Store(detail) => detail.clone(),
+                _ => err.to_string(),
+            };
+            json_response(
+                500,
+                &json!({"error": "unlock_failed", "detail": detail, "state": "error"}),
+            )
+        }
+    }
+}
+
+fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> Response {
     match outcome {
         HandoffOutcome::Unlocked => {
             state.ownership.set_unlocked();
@@ -562,6 +933,67 @@ pub async fn unlock(
     }
 }
 
+async fn maybe_refresh_auto_unlock_seal(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
+        return Ok(None);
+    }
+    let wrap_key = state
+        .ownership
+        .derive_sealing_wrap_key(&state.config.instance_id)?;
+    let sealed = state.ownership.encrypt_owner_seed(owner_seed, &wrap_key)?;
+    update_owner_seed_material(
+        state,
+        EscrowValueUpdate::Keep,
+        EscrowValueUpdate::Set(&sealed),
+    )
+    .await
+    .map(|_| None)
+    .or_else(|_| Ok(Some("auto_unlock_reseal_failed".to_string())))
+}
+
+async fn unlock_owner_seed_material(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    let owner_keys = Zeroizing::new(state.ownership.derive_owner_volume_keys(owner_seed)?);
+    state.ownership.write_password_handoff_keys(&owner_keys)?;
+    let outcome = state
+        .ownership
+        .poll_password_handoff_result(unlock_poll_timeout_seconds())?;
+    render_password_handoff_outcome(state, outcome, owner_seed).await
+}
+
+async fn render_password_handoff_outcome(
+    state: &AppState,
+    outcome: HandoffOutcome,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    match outcome {
+        HandoffOutcome::Unlocked => {
+            state.ownership.set_unlocked();
+            maybe_refresh_auto_unlock_seal(state, owner_seed).await
+        }
+        HandoffOutcome::WrongPassword => {
+            Err(OwnershipError::WrongPassword)
+        }
+        HandoffOutcome::Fatal(message) => {
+            let detail = match message.split_once(':') {
+                Some((slot, reason)) if slot == SIGNAL_APP_DATA_SLOT || slot == SIGNAL_TLS_DATA_SLOT => {
+                    format!("{slot}_unlock_failed:{reason}")
+                }
+                _ => message,
+            };
+            Err(OwnershipError::Store(detail))
+        }
+        HandoffOutcome::Timeout => {
+            Err(OwnershipError::Timeout)
+        }
+    }
+}
+
 #[cfg(test)]
 fn unlock_poll_timeout_seconds() -> u64 {
     1
@@ -570,6 +1002,395 @@ fn unlock_poll_timeout_seconds() -> u64 {
 #[cfg(not(test))]
 fn unlock_poll_timeout_seconds() -> u64 {
     crate::ownership::HANDOFF_DEFAULT_TIMEOUT_SECONDS
+}
+
+pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
+    if !state.ownership.requires_manual_unlock() {
+        return json_response(404, &json!({"error": "not_found"}));
+    }
+    if !state.ownership.is_unclaimed() {
+        return json_response(409, &json!({"error": "already_claimed", "state": state.ownership.state_json()}));
+    }
+
+    let identity = fetch_ownership_identity(&state).await;
+    if identity.bootstrap_owner_pubkey_hash.is_none() {
+        return json_response(
+            409,
+            &json!({"error": "bootstrap_owner_pubkey_hash_missing", "claims_error": identity.claims_error}),
+        );
+    }
+
+    let mut challenge_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut challenge_bytes);
+    let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
+    let expires_at = Instant::now()
+        + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds);
+    {
+        let mut slot = state
+            .bootstrap_challenge
+            .lock()
+            .expect("bootstrap challenge lock poisoned");
+        *slot = Some(BootstrapChallenge {
+            challenge_b64: challenge_b64.clone(),
+            expires_at,
+        });
+    }
+
+    json_response(
+        200,
+        &json!({
+            "instance_id": state.config.instance_id,
+            "challenge": challenge_b64,
+            "nonce": challenge_b64,
+            "expires_in_seconds": state.config.ownership_challenge_ttl_seconds,
+        }),
+    )
+}
+
+pub async fn bootstrap_claim(
+    State(state): State<AppState>,
+    Json(payload): Json<BootstrapClaimRequest>,
+) -> Response {
+    if !state.ownership.requires_manual_unlock() {
+        return json_response(404, &json!({"error": "not_found"}));
+    }
+    if !state.ownership.is_unclaimed() {
+        return json_response(409, &json!({"error": "already_claimed", "state": state.ownership.state_json()}));
+    }
+    if payload.password.trim().is_empty() {
+        return json_response(400, &json!({"error": "password_required"}));
+    }
+
+    let challenge_ok = {
+        let slot = state
+            .bootstrap_challenge
+            .lock()
+            .expect("bootstrap challenge lock poisoned");
+        match slot.as_ref() {
+            Some(challenge)
+                if challenge.challenge_b64 == payload.challenge && Instant::now() < challenge.expires_at =>
+            {
+                true
+            }
+            _ => false,
+        }
+    };
+    if !challenge_ok {
+        return json_response(400, &json!({"error": "bootstrap_challenge_invalid"}));
+    }
+
+    let identity = fetch_ownership_identity(&state).await;
+    let expected_hash = match identity.bootstrap_owner_pubkey_hash {
+        Some(hash) => hash,
+        None => {
+            return json_response(
+                409,
+                &json!({"error": "bootstrap_owner_pubkey_hash_missing", "claims_error": identity.claims_error}),
+            )
+        }
+    };
+
+    if let Err(err) = validate_bootstrap_signature(
+        &payload.challenge,
+        &payload.bootstrap_pubkey,
+        &payload.signature,
+        &expected_hash,
+    ) {
+        return json_response(
+            401,
+            &json!({"error": "bootstrap_signature_invalid", "detail": err.to_string()}),
+        );
+    }
+
+    let mut password = Zeroizing::new(payload.password.into_bytes());
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "claim_failed", "detail": err.to_string()}),
+            )
+        }
+    };
+
+    let mut owner_seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut owner_seed);
+    let owner_seed = Zeroizing::new(owner_seed);
+    let encrypted = match state.ownership.encrypt_owner_seed(&owner_seed, &wrap_key) {
+        Ok(encrypted) => encrypted,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "claim_failed", "detail": err.to_string()}),
+            )
+        }
+    };
+
+    if let Err(err) = update_owner_seed_material(
+        &state,
+        EscrowValueUpdate::Set(&encrypted),
+        EscrowValueUpdate::Remove,
+    )
+    .await
+    {
+        return json_response(
+            500,
+            &json!({"error": "claim_failed", "detail": err.to_string()}),
+        );
+    }
+    state.ownership.set_auto_unlock_enabled(false);
+    state.ownership.set_locked();
+
+    match unlock_owner_seed_material(&state, &owner_seed).await {
+        Ok(warning) => {
+            let mnemonic = state
+                .ownership
+                .owner_seed_mnemonic(&owner_seed)
+                .unwrap_or_default();
+            let owner_pubkey = state
+                .ownership
+                .owner_public_key_b64url(&owner_seed)
+                .unwrap_or_default();
+            {
+                let mut slot = state
+                    .bootstrap_challenge
+                    .lock()
+                    .expect("bootstrap challenge lock poisoned");
+                *slot = None;
+            }
+            json_response(
+                200,
+                &json!({
+                    "status": "CLAIM_ACCEPTED",
+                    "state": "unlocked",
+                    "owner_public_key": owner_pubkey,
+                    "owner_seed_mnemonic": mnemonic,
+                    "warning": warning,
+                }),
+            )
+        }
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            json_response(
+                500,
+                &json!({"error": "claim_failed", "detail": err.to_string(), "state": "error"}),
+            )
+        }
+    }
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Response {
+    let mut old_password = Zeroizing::new(payload.old_password.into_bytes());
+    let mut new_password = Zeroizing::new(payload.new_password.into_bytes());
+    if old_password.is_empty() || new_password.is_empty() {
+        return json_response(400, &json!({"error": "password_required"}));
+    }
+
+    let material = match load_owner_seed_material(&state).await {
+        Ok(material) if material.encrypted.is_some() => material,
+        Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
+        Err(err) => {
+            return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}))
+        }
+    };
+
+    let old_wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut old_password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => {
+            return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}))
+        }
+    };
+    let owner_seed = match state
+        .ownership
+        .decrypt_owner_seed(material.encrypted.as_ref().expect("encrypted present"), &old_wrap_key)
+    {
+        Ok(seed) => Zeroizing::new(seed),
+        Err(OwnershipError::WrongPassword) => {
+            return json_response(401, &json!({"error": "wrong_password"}))
+        }
+        Err(err) => {
+            return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}))
+        }
+    };
+    let new_wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut new_password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => {
+            return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}))
+        }
+    };
+    let encrypted = match state.ownership.encrypt_owner_seed(&owner_seed, &new_wrap_key) {
+        Ok(encrypted) => encrypted,
+        Err(err) => {
+            return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}))
+        }
+    };
+
+    if let Err(err) = update_owner_seed_material(
+        &state,
+        EscrowValueUpdate::Set(&encrypted),
+        EscrowValueUpdate::Keep,
+    )
+    .await
+    {
+        return json_response(500, &json!({"error": "change_password_failed", "detail": err.to_string()}));
+    }
+
+    json_response(200, &json!({"status": "password_changed"}))
+}
+
+pub async fn recover(
+    State(state): State<AppState>,
+    Json(payload): Json<RecoverRequest>,
+) -> Response {
+    if payload.new_password.trim().is_empty() || payload.mnemonic.trim().is_empty() {
+        return json_response(400, &json!({"error": "mnemonic_and_password_required"}));
+    }
+
+    let owner_seed = match state.ownership.owner_seed_from_mnemonic(&payload.mnemonic) {
+        Ok(seed) => Zeroizing::new(seed),
+        Err(err) => return json_response(400, &json!({"error": "mnemonic_invalid", "detail": err.to_string()})),
+    };
+    let mut new_password = Zeroizing::new(payload.new_password.into_bytes());
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut new_password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => return json_response(500, &json!({"error": "recover_failed", "detail": err.to_string()})),
+    };
+    let encrypted = match state.ownership.encrypt_owner_seed(&owner_seed, &wrap_key) {
+        Ok(encrypted) => encrypted,
+        Err(err) => return json_response(500, &json!({"error": "recover_failed", "detail": err.to_string()})),
+    };
+    if let Err(err) = update_owner_seed_material(
+        &state,
+        EscrowValueUpdate::Set(&encrypted),
+        EscrowValueUpdate::Keep,
+    )
+    .await
+    {
+        return json_response(500, &json!({"error": "recover_failed", "detail": err.to_string()}));
+    }
+
+    match unlock_owner_seed_material(&state, &owner_seed).await {
+        Ok(warning) => {
+            let owner_pubkey = state
+                .ownership
+                .owner_public_key_b64url(&owner_seed)
+                .unwrap_or_default();
+            json_response(200, &json!({"status": "recovered", "state": "unlocked", "owner_public_key": owner_pubkey, "warning": warning}))
+        }
+        Err(err) => {
+            state.ownership.set_error(err.to_string());
+            json_response(500, &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}))
+        }
+    }
+}
+
+pub async fn enable_auto_unlock(
+    State(state): State<AppState>,
+    Json(payload): Json<UnlockRequest>,
+) -> Response {
+    let mut password = Zeroizing::new(payload.password.into_bytes());
+    if password.is_empty() {
+        return json_response(400, &json!({"error": "password_required"}));
+    }
+    let material = match load_owner_seed_material(&state).await {
+        Ok(material) if material.encrypted.is_some() => material,
+        Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
+        Err(err) => return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    let owner_seed = match state
+        .ownership
+        .decrypt_owner_seed(material.encrypted.as_ref().expect("encrypted present"), &wrap_key)
+    {
+        Ok(seed) => Zeroizing::new(seed),
+        Err(OwnershipError::WrongPassword) => return json_response(401, &json!({"error": "wrong_password"})),
+        Err(err) => return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    let seal_key = match state
+        .ownership
+        .derive_sealing_wrap_key(&state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    let sealed = match state.ownership.encrypt_owner_seed(&owner_seed, &seal_key) {
+        Ok(sealed) => sealed,
+        Err(err) => return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    if let Err(err) = update_owner_seed_material(
+        &state,
+        EscrowValueUpdate::Keep,
+        EscrowValueUpdate::Set(&sealed),
+    )
+    .await
+    {
+        return json_response(500, &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}));
+    }
+    state.ownership.set_auto_unlock_enabled(true);
+    json_response(200, &json!({"status": "auto_unlock_enabled"}))
+}
+
+pub async fn disable_auto_unlock(
+    State(state): State<AppState>,
+    Json(payload): Json<UnlockRequest>,
+) -> Response {
+    let mut password = Zeroizing::new(payload.password.into_bytes());
+    if password.is_empty() {
+        return json_response(400, &json!({"error": "password_required"}));
+    }
+    let material = match load_owner_seed_material(&state).await {
+        Ok(material) if material.encrypted.is_some() => material,
+        Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
+        Err(err) => return json_response(500, &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut password, &state.config.instance_id)
+    {
+        Ok(key) => Zeroizing::new(key),
+        Err(err) => return json_response(500, &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()})),
+    };
+    if let Err(err) = state
+        .ownership
+        .decrypt_owner_seed(material.encrypted.as_ref().expect("encrypted present"), &wrap_key)
+    {
+        return match err {
+            OwnershipError::WrongPassword => json_response(401, &json!({"error": "wrong_password"})),
+            _ => json_response(500, &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()})),
+        };
+    }
+    if let Err(err) = update_owner_seed_material(
+        &state,
+        EscrowValueUpdate::Keep,
+        EscrowValueUpdate::Remove,
+    )
+    .await
+    {
+        return json_response(500, &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()}));
+    }
+    state.ownership.set_auto_unlock_enabled(false);
+    json_response(200, &json!({"status": "auto_unlock_disabled"}))
 }
 
 /// Fallback handler for unmatched routes.
@@ -590,17 +1411,32 @@ pub async fn not_found(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+    use axum::extract::{Path as AxumPath, State as AxumState};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use ed25519_dalek::{Signer, SigningKey};
     use crate::attestation::AaTokenCache;
     use crate::config::Config;
     use crate::kbs::KbsCacheEntry;
-    use crate::ownership::{OwnershipGuard, SIGNAL_ERROR_FILE, SIGNAL_KEY_FILE, SIGNAL_UNLOCKED_FILE};
+    use crate::ownership::{
+        OwnershipGuard, OWNER_SEED_ENVELOPE_VERSION, SIGNAL_APP_DATA_SLOT, SIGNAL_ERROR_FILE,
+        SIGNAL_KEY_FILE, SIGNAL_TLS_DATA_SLOT, SIGNAL_UNLOCKED_FILE,
+    };
+    use axum::Router;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::RwLock;
+    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn unlock_handoff_success() {
@@ -743,10 +1579,436 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unlock_password_mode_success() {
+        let signal_dir = test_signal_dir("unlock-password-success");
+        let owner_seed = [0x21; 32];
+        let kbs_server = spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT)).expect("create tls slot");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write app unlocked sentinel");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write tls unlocked sentinel");
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: "correct-password".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert!(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "app-data key file should be written"
+        );
+        assert!(
+            signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "tls-data key file should be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_password_mode_wrong_password() {
+        let signal_dir = test_signal_dir("unlock-password-wrong-password");
+        let owner_seed = [0x31; 32];
+        let kbs_server = spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: "bad-password".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            read_json(response).await,
+            json!({ "error": "wrong_password", "state": "locked" })
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "password failures must not write app-data key files"
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "password failures must not write tls-data key files"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_password_mode_slot_failure_surfaces_slot_name() {
+        let signal_dir = test_signal_dir("unlock-password-slot-failure");
+        let owner_seed = [0x41; 32];
+        let kbs_server = spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT)).expect("create tls slot");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_ERROR_FILE),
+            "mount_failed\n",
+        )
+        .expect("write slot error");
+
+        let response = unlock(
+            State(state),
+            Json(UnlockRequest {
+                password: "correct-password".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(
+            read_json(response).await,
+            json!({
+                "error": "unlock_failed",
+                "detail": "app-data_unlock_failed:mount_failed",
+                "state": "error"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_persists_encrypted_seed_and_returns_recovery_material() {
+        let signal_dir = test_signal_dir("bootstrap-claim");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("bootstrap-claim-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let body = claim_owner(&state, &signing_key, "claim-password").await;
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("CLAIM_ACCEPTED"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
+        assert!(
+            body.get("owner_seed_mnemonic")
+                .and_then(Value::as_str)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false),
+            "claim should return a non-empty mnemonic"
+        );
+
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        assert!(
+            decode_secret_field(&secret, "seed-sealed").is_none(),
+            "claim should not create an auto-unlock seal"
+        );
+
+        let owner_seed = decrypt_owner_seed_with_password(&state, &encrypted, "claim-password");
+        assert_eq!(
+            state.ownership.owner_seed_mnemonic(&owner_seed).unwrap(),
+            body.get("owner_seed_mnemonic")
+                .and_then(Value::as_str)
+                .unwrap()
+        );
+        assert_eq!(
+            state.ownership.owner_public_key_b64url(&owner_seed).unwrap(),
+            body.get("owner_public_key").and_then(Value::as_str).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn change_password_rewraps_seed_without_rotating_owner_identity() {
+        let signal_dir = test_signal_dir("change-password");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("change-password-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "old-password").await;
+        let expected_owner_public_key = claim
+            .get("owner_public_key")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let response = change_password(
+            State(state.clone()),
+            Json(ChangePasswordRequest {
+                old_password: "old-password".to_string(),
+                new_password: "new-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            read_json(response).await,
+            json!({"status": "password_changed"})
+        );
+
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        let owner_seed = decrypt_owner_seed_with_password(&state, &encrypted, "new-password");
+        assert_eq!(
+            state.ownership.owner_public_key_b64url(&owner_seed).unwrap(),
+            expected_owner_public_key
+        );
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &encrypted, "old-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_rewraps_seed_from_mnemonic_and_unlocks() {
+        let signal_dir = test_signal_dir("recover");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "initial-password").await;
+        let mnemonic = claim
+            .get("owner_seed_mnemonic")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let expected_owner_public_key = claim
+            .get("owner_public_key")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic,
+                new_password: "recovered-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("recovered"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
+        assert_eq!(
+            body.get("owner_public_key").and_then(Value::as_str),
+            Some(expected_owner_public_key.as_str())
+        );
+
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        let owner_seed = decrypt_owner_seed_with_password(&state, &encrypted, "recovered-password");
+        assert_eq!(
+            state.ownership.owner_public_key_b64url(&owner_seed).unwrap(),
+            expected_owner_public_key
+        );
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_unlock_enable_disable_and_startup_resume_round_trip() {
+        let signal_dir = test_signal_dir("auto-unlock");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[10u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("auto-unlock-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let enable = enable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: "claim-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(enable.status().as_u16(), 200);
+        assert_eq!(
+            read_json(enable).await,
+            json!({"status": "auto_unlock_enabled"})
+        );
+        assert!(state.ownership.auto_unlock_enabled());
+        let secret = api_server.secret_json();
+        assert!(
+            decode_secret_field(&secret, "seed-sealed").is_some(),
+            "enable-auto-unlock should persist the sealed seed copy"
+        );
+
+        let restart_signal_dir = test_signal_dir("auto-unlock-restart");
+        mark_password_slots_unlocked(&restart_signal_dir.path);
+        let restart_state = build_state_with_secret_backend(
+            &restart_signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&restart_state).await;
+        spawn_auto_unlock_if_needed(restart_state.clone());
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            restart_state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unlocked")
+        );
+
+        let disable = disable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: "claim-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(disable.status().as_u16(), 200);
+        assert_eq!(
+            read_json(disable).await,
+            json!({"status": "auto_unlock_disabled"})
+        );
+        assert!(!state.ownership.auto_unlock_enabled());
+        let secret = api_server.secret_json();
+        assert!(
+            decode_secret_field(&secret, "seed-sealed").is_none(),
+            "disable-auto-unlock should remove the sealed seed copy"
+        );
+    }
+
     fn build_state(signal_dir: &PathBuf) -> AppState {
+        build_state_with_mode(signal_dir, "level1", "http://127.0.0.1:9".to_string(), None)
+    }
+
+    fn build_state_with_mode(
+        signal_dir: &PathBuf,
+        mode: &str,
+        base_url: String,
+        owner_seed_encrypted_kbs_path: Option<String>,
+    ) -> AppState {
         let mut config = Config::from_env_for_test();
-        config.storage_ownership_mode = "level1".to_string();
+        config.storage_ownership_mode = mode.to_string();
         config.instance_id = "instance-test-01".to_string();
+        config.kbs_resource_url = format!("{base_url}/kbs/v0/resource");
+        config.aa_token_url = format!("{base_url}/aa/token");
+        config.owner_seed_encrypted_kbs_path = owner_seed_encrypted_kbs_path.unwrap_or_default();
+        config.owner_ciphertext_backend = if config.owner_seed_encrypted_kbs_path.is_empty() {
+            "kubernetes-secret".to_string()
+        } else {
+            "kbs-resource".to_string()
+        };
+        config.owner_seed_sealed_kbs_path = "default/instance-test-01-owner/seed-sealed".to_string();
+        config.attestation_pod_namespace = "tenant-test".to_string();
+        config.owner_escrow_secret_name = "instance-test-01-owner-escrow".to_string();
+        config.k8s_api_url = base_url;
 
         AppState {
             config: Arc::new(config),
@@ -754,9 +2016,46 @@ mod tests {
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
-                "level1".to_string(),
+                mode.to_string(),
                 signal_dir.clone(),
             )),
+            bootstrap_challenge: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn build_state_with_secret_backend(
+        signal_dir: &PathBuf,
+        mode: &str,
+        base_url: String,
+        token_path: &Path,
+    ) -> AppState {
+        let mut config = Config::from_env_for_test();
+        config.storage_ownership_mode = mode.to_string();
+        config.instance_id = "instance-test-01".to_string();
+        config.owner_ciphertext_backend = "kubernetes-secret".to_string();
+        config.owner_seed_encrypted_kbs_path =
+            "default/instance-test-01-owner/seed-encrypted".to_string();
+        config.owner_seed_sealed_kbs_path =
+            "default/instance-test-01-owner/seed-sealed".to_string();
+        config.owner_escrow_secret_name = "instance-test-01-owner-escrow".to_string();
+        config.owner_escrow_encrypted_key = "seed-encrypted".to_string();
+        config.owner_escrow_sealed_key = "seed-sealed".to_string();
+        config.attestation_pod_namespace = "tenant-test".to_string();
+        config.k8s_api_url = base_url.clone();
+        config.k8s_service_account_token_path = token_path.display().to_string();
+        config.aa_token_url = format!("{base_url}/aa/token");
+        config.kbs_resource_url = format!("{base_url}/kbs/v0/resource");
+
+        AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                mode.to_string(),
+                signal_dir.clone(),
+            )),
+            bootstrap_challenge: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -789,5 +2088,309 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp signal dir");
         TestSignalDir { path }
+    }
+
+    struct TestTempFile {
+        path: PathBuf,
+    }
+
+    impl Drop for TestTempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn test_temp_file(prefix: &str, contents: &str) -> TestTempFile {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "attestation-proxy-test-{prefix}-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::write(&path, contents).expect("write temp file");
+        TestTempFile { path }
+    }
+
+    #[derive(Clone)]
+    struct TestApiState {
+        aa_token_response: Value,
+        owner_secret: Arc<Mutex<Value>>,
+        kbs_resources: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    struct TestApiServer {
+        addr: SocketAddr,
+        task: tokio::task::JoinHandle<()>,
+        owner_secret: Arc<Mutex<Value>>,
+    }
+
+    impl TestApiServer {
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn secret_json(&self) -> Value {
+            self.owner_secret
+                .lock()
+                .expect("owner secret lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Drop for TestApiServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn get_owner_secret(AxumState(state): AxumState<TestApiState>) -> impl IntoResponse {
+        Json(
+            state
+                .owner_secret
+                .lock()
+                .expect("owner secret lock poisoned")
+                .clone(),
+        )
+    }
+
+    async fn put_owner_secret(
+        AxumState(state): AxumState<TestApiState>,
+        Json(secret): Json<Value>,
+    ) -> impl IntoResponse {
+        *state
+            .owner_secret
+            .lock()
+            .expect("owner secret lock poisoned") = secret.clone();
+        (StatusCode::OK, Json(secret))
+    }
+
+    async fn get_kbs_resource(
+        AxumState(state): AxumState<TestApiState>,
+        AxumPath(path): AxumPath<String>,
+    ) -> impl IntoResponse {
+        let resources = state
+            .kbs_resources
+            .lock()
+            .expect("kbs resource lock poisoned");
+        match resources.get(&path) {
+            Some(body) => (StatusCode::OK, body.clone()).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
+        }
+    }
+
+    async fn test_aa_token_handler(AxumState(state): AxumState<TestApiState>) -> Json<Value> {
+        Json(state.aa_token_response.clone())
+    }
+
+    async fn spawn_test_api_server(
+        owner_secret: Value,
+        aa_claims: Value,
+        kbs_resources: HashMap<String, String>,
+    ) -> TestApiServer {
+        let owner_secret = Arc::new(Mutex::new(owner_secret));
+        let state = TestApiState {
+            aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
+            owner_secret: owner_secret.clone(),
+            kbs_resources: Arc::new(Mutex::new(kbs_resources)),
+        };
+        let router = Router::new()
+            .route(
+                "/api/v1/namespaces/tenant-test/secrets/instance-test-01-owner-escrow",
+                get(get_owner_secret).put(put_owner_secret),
+            )
+            .route("/kbs/v0/resource/{*path}", get(get_kbs_resource))
+            .route("/aa/token", get(test_aa_token_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test api server");
+        let addr = listener.local_addr().expect("local addr");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve test api server");
+        });
+        TestApiServer {
+            addr,
+            task,
+            owner_secret,
+        }
+    }
+
+    async fn spawn_owner_seed_server(
+        owner_seed: [u8; 32],
+        password: &str,
+        instance_id: &str,
+    ) -> TestApiServer {
+        let mut resources = HashMap::new();
+        resources.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            owner_seed_envelope_json(owner_seed, password, instance_id),
+        );
+        spawn_test_api_server(owner_escrow_secret_json(None, None), json!({}), resources).await
+    }
+
+    fn owner_seed_envelope_json(owner_seed: [u8; 32], password: &str, instance_id: &str) -> String {
+        let guard = OwnershipGuard::new("password".to_string());
+        let mut password = Zeroizing::new(password.as_bytes().to_vec());
+        let wrap_key = guard
+            .derive_password_wrap_key(&mut password, instance_id)
+            .expect("derive password wrap key for test");
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key).expect("cipher");
+        let nonce_bytes = [9u8; 12];
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
+            .expect("encrypt owner seed");
+        json!({
+            "version": OWNER_SEED_ENVELOPE_VERSION,
+            "nonce": BASE64_STANDARD.encode(nonce_bytes),
+            "ciphertext": BASE64_STANDARD.encode(ciphertext),
+        })
+        .to_string()
+    }
+
+    fn owner_escrow_secret_json(encrypted: Option<&[u8]>, sealed: Option<&[u8]>) -> Value {
+        let mut data = serde_json::Map::new();
+        if let Some(encrypted) = encrypted {
+            data.insert(
+                "seed-encrypted".to_string(),
+                Value::String(BASE64_STANDARD.encode(encrypted)),
+            );
+        }
+        if let Some(sealed) = sealed {
+            data.insert(
+                "seed-sealed".to_string(),
+                Value::String(BASE64_STANDARD.encode(sealed)),
+            );
+        }
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "instance-test-01-owner-escrow",
+                "namespace": "tenant-test",
+                "resourceVersion": "1",
+            },
+            "data": Value::Object(data),
+            "type": "Opaque",
+        })
+    }
+
+    fn decode_secret_field(secret: &Value, key: &str) -> Option<Vec<u8>> {
+        secret
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| data.get(key))
+            .and_then(Value::as_str)
+            .map(|value| BASE64_STANDARD.decode(value.as_bytes()).expect("decode secret field"))
+    }
+
+    fn test_identity_claims(bootstrap_owner_pubkey_hash: &str) -> Value {
+        json!({
+            "init_data_claims": {
+                "identity": {
+                    "bootstrap_owner_pubkey_hash": bootstrap_owner_pubkey_hash,
+                    "tenant_instance_identity_hash": "test-tenant-instance-hash",
+                    "tenant_id": "tenant-test",
+                    "instance_id": "instance-test-01"
+                }
+            }
+        })
+    }
+
+    fn jwt_for_claims(claims: &Value) -> String {
+        let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(claims).expect("serialize claims"),
+        );
+        let token = format!(
+            "{header}.{payload}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(b"sig")
+        );
+        assert!(
+            crate::attestation::parse_jwt_payload(&token).is_some(),
+            "test jwt must parse"
+        );
+        token
+    }
+
+    fn bootstrap_owner_pubkey_hash(signing_key: &SigningKey) -> String {
+        let digest = sha2::Sha256::digest(signing_key.verifying_key().as_bytes());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn claim_owner(state: &AppState, signing_key: &SigningKey, password: &str) -> Value {
+        let challenge = bootstrap_challenge(State(state.clone())).await;
+        let challenge_body = read_json(challenge).await;
+        assert_eq!(
+            challenge_body.get("error").is_none(),
+            true,
+            "bootstrap challenge failed: {challenge_body}"
+        );
+        let challenge_b64 = challenge_body
+            .get("challenge")
+            .and_then(Value::as_str)
+            .expect("challenge");
+        let challenge_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(challenge_b64.as_bytes())
+            .expect("decode challenge");
+        let signature = signing_key.sign(&challenge_bytes);
+        let response = bootstrap_claim(
+            State(state.clone()),
+            Json(BootstrapClaimRequest {
+                challenge: challenge_b64.to_string(),
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: password.to_string(),
+            }),
+        )
+        .await;
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("error").is_none(),
+            true,
+            "bootstrap claim failed: {body}"
+        );
+        body
+    }
+
+    fn decrypt_owner_seed_with_password(
+        state: &AppState,
+        encrypted: &[u8],
+        password: &str,
+    ) -> [u8; 32] {
+        decrypt_owner_seed_result(state, encrypted, password).expect("decrypt owner seed")
+    }
+
+    fn decrypt_owner_seed_result(
+        state: &AppState,
+        encrypted: &[u8],
+        password: &str,
+    ) -> Result<[u8; 32], OwnershipError> {
+        let mut password = Zeroizing::new(password.as_bytes().to_vec());
+        let wrap_key = state
+            .ownership
+            .derive_password_wrap_key(&mut password, &state.config.instance_id)
+            .expect("derive password wrap key");
+        state.ownership.decrypt_owner_seed(encrypted, &wrap_key)
+    }
+
+    fn mark_password_slots_unlocked(signal_dir: &Path) {
+        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
+            let slot_dir = signal_dir.join(slot);
+            fs::create_dir_all(&slot_dir).expect("create slot dir");
+            fs::write(slot_dir.join(SIGNAL_UNLOCKED_FILE), "unlocked_at=now")
+                .expect("write unlocked sentinel");
+        }
+    }
+
+    fn clear_password_slot_artifacts(signal_dir: &Path) {
+        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
+            for name in [SIGNAL_KEY_FILE, SIGNAL_UNLOCKED_FILE, SIGNAL_ERROR_FILE] {
+                let _ = fs::remove_file(signal_dir.join(slot).join(name));
+            }
+        }
     }
 }
