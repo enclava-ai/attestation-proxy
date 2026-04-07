@@ -138,10 +138,17 @@ pub fn derive_measurement_policy_key() -> Result<[u8; 32], String> {
         return Err(format!("sev_guest_derived_key_error:fw={fw_error}:vmm={vmm_error}"));
     }
 
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&resp.data[..32]);
-    if out.iter().all(|byte| *byte == 0) {
-        return Err("sev_guest_derived_key_zero".to_string());
+    let mut first = [0u8; 32];
+    first.copy_from_slice(&resp.data[..32]);
+    if first.iter().any(|byte| *byte != 0) {
+        return Ok(first);
     }
-    Ok(out)
+
+    let mut second = [0u8; 32];
+    second.copy_from_slice(&resp.data[32..64]);
+    if second.iter().any(|byte| *byte != 0) {
+        return Ok(second);
+    }
+
+    Err("sev_guest_derived_key_zero".to_string())
 }
