@@ -209,12 +209,22 @@ async fn fetch_ownership_identity(state: &AppState) -> OwnershipIdentity {
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let bootstrap_owner_pubkey_hash =
+        attestation::extract_bootstrap_owner_pubkey_hash(&claims).or_else(|| {
+            (!state.config.bootstrap_owner_pubkey_hash.is_empty())
+                .then(|| state.config.bootstrap_owner_pubkey_hash.clone())
+        });
+    let tenant_instance_identity_hash =
+        attestation::extract_tenant_instance_identity_hash(&claims).or_else(|| {
+            (!state.config.tenant_instance_identity_hash.is_empty())
+                .then(|| state.config.tenant_instance_identity_hash.clone())
+        });
 
     OwnershipIdentity {
         tenant_id: attestation::extract_tenant_id(&claims),
         instance_id: attestation::extract_instance_id(&claims),
-        bootstrap_owner_pubkey_hash: attestation::extract_bootstrap_owner_pubkey_hash(&claims),
-        tenant_instance_identity_hash: attestation::extract_tenant_instance_identity_hash(&claims),
+        bootstrap_owner_pubkey_hash,
+        tenant_instance_identity_hash,
         claims_error: error,
     }
 }

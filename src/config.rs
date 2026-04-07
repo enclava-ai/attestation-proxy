@@ -31,6 +31,8 @@ pub struct Config {
     pub attestation_k8s_api_timeout_seconds: f64,
     pub storage_ownership_mode: String,
     pub instance_id: String,
+    pub bootstrap_owner_pubkey_hash: String,
+    pub tenant_instance_identity_hash: String,
     pub owner_ciphertext_backend: String,
     pub owner_seed_encrypted_kbs_path: String,
     pub owner_seed_sealed_kbs_path: String,
@@ -153,6 +155,8 @@ impl Config {
             ),
             storage_ownership_mode,
             instance_id,
+            bootstrap_owner_pubkey_hash: env_or("BOOTSTRAP_OWNER_PUBKEY_HASH", ""),
+            tenant_instance_identity_hash: env_or("TENANT_INSTANCE_IDENTITY_HASH", ""),
             owner_ciphertext_backend,
             owner_seed_encrypted_kbs_path,
             owner_seed_sealed_kbs_path,
@@ -207,6 +211,8 @@ impl Config {
             attestation_k8s_api_timeout_seconds: 6.0,
             storage_ownership_mode: "legacy".into(),
             instance_id: "".into(),
+            bootstrap_owner_pubkey_hash: "".into(),
+            tenant_instance_identity_hash: "".into(),
             owner_ciphertext_backend: "kbs-resource".into(),
             owner_seed_encrypted_kbs_path: "".into(),
             owner_seed_sealed_kbs_path: "".into(),
@@ -261,6 +267,8 @@ mod tests {
         "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
         "STORAGE_OWNERSHIP_MODE",
         "INSTANCE_ID",
+        "BOOTSTRAP_OWNER_PUBKEY_HASH",
+        "TENANT_INSTANCE_IDENTITY_HASH",
         "OWNER_CIPHERTEXT_BACKEND",
         "OWNER_SEED_ENCRYPTED_KBS_PATH",
         "OWNER_SEED_SEALED_KBS_PATH",
@@ -325,6 +333,8 @@ mod tests {
         assert_eq!(config.attestation_k8s_api_timeout_seconds, 6.0);
         assert_eq!(config.storage_ownership_mode, "legacy");
         assert_eq!(config.instance_id, "");
+        assert_eq!(config.bootstrap_owner_pubkey_hash, "");
+        assert_eq!(config.tenant_instance_identity_hash, "");
         assert_eq!(config.owner_ciphertext_backend, "kbs-resource");
         assert_eq!(config.owner_seed_encrypted_kbs_path, "");
         assert_eq!(config.owner_seed_sealed_kbs_path, "");
