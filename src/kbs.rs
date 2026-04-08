@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use crate::attestation::fetch_kbs_bearer_token;
-use crate::ownership::utc_now;
+use crate::ownership::{utc_now, OwnershipError};
 
 pub struct KbsCacheEntry {
     pub body: Vec<u8>,
@@ -254,9 +254,145 @@ pub async fn fetch_kbs_resource(
     }
 }
 
+/// Evict a cached KBS resource entry after a write or delete.
+/// This ensures read-after-write consistency for paths that were
+/// modified via the workload-resource endpoint.
+pub async fn evict_kbs_cache_entry(state: &crate::AppState, cache_key: &str) {
+    let mut cache = state.kbs_resource_cache.write().await;
+    cache.remove(cache_key);
+}
+
+/// Derive the workload-resource base URL from kbs_resource_url.
+/// Replaces the trailing `/resource` segment with `/workload-resource`.
+/// E.g. "http://host:8080/kbs/v0/resource" -> "http://host:8080/kbs/v0/workload-resource"
+fn workload_resource_base(kbs_resource_url: &str) -> String {
+    let base = kbs_resource_url.trim_end_matches('/');
+    if base.ends_with("/resource") {
+        format!(
+            "{}/workload-resource",
+            &base[..base.len() - "/resource".len()]
+        )
+    } else {
+        format!("{}/workload-resource", base)
+    }
+}
+
+/// Write ciphertext to KBS via the workload-resource endpoint.
+/// Uses PUT /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
+pub async fn put_kbs_workload_resource(
+    state: &crate::AppState,
+    resource_path: &str,
+    body: &[u8],
+) -> Result<(), OwnershipError> {
+    let token = fetch_kbs_bearer_token(state)
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
+
+    let workload_url = format!(
+        "{}/{resource_path}",
+        workload_resource_base(&state.config.kbs_resource_url)
+    );
+
+    let response = state
+        .http_client
+        .put(&workload_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .timeout(std::time::Duration::from_secs(20))
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_workload_put_failed:{e}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let resp_body = response.text().await.unwrap_or_default();
+        return Err(OwnershipError::Store(format!(
+            "kbs_workload_put_non_200:{status}:{resp_body}"
+        )));
+    }
+    // Evict cached entry to ensure read-after-write consistency
+    evict_kbs_cache_entry(state, resource_path).await;
+    Ok(())
+}
+
+/// Delete ciphertext from KBS via the workload-resource endpoint.
+/// Uses DELETE /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
+pub async fn delete_kbs_workload_resource(
+    state: &crate::AppState,
+    resource_path: &str,
+) -> Result<(), OwnershipError> {
+    let token = fetch_kbs_bearer_token(state)
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
+
+    let workload_url = format!(
+        "{}/{resource_path}",
+        workload_resource_base(&state.config.kbs_resource_url)
+    );
+
+    let response = state
+        .http_client
+        .delete(&workload_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_workload_delete_failed:{e}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let resp_body = response.text().await.unwrap_or_default();
+        return Err(OwnershipError::Store(format!(
+            "kbs_workload_delete_non_200:{status}:{resp_body}"
+        )));
+    }
+    // Evict cached entry to ensure read-after-write consistency
+    evict_kbs_cache_entry(state, resource_path).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_workload_resource_url_derivation() {
+        let base =
+            "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource";
+        let derived = format!(
+            "{}/default/test-owner/seed-encrypted",
+            workload_resource_base(base)
+        );
+        assert_eq!(
+            derived,
+            "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/workload-resource/default/test-owner/seed-encrypted"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_url_derivation_no_trailing_resource() {
+        let base = "http://kbs:8080/kbs/v0/custom";
+        let derived = format!(
+            "{}/default/owner/seed",
+            workload_resource_base(base)
+        );
+        assert_eq!(derived, "http://kbs:8080/kbs/v0/custom/workload-resource/default/owner/seed");
+    }
+
+    #[test]
+    fn test_workload_resource_url_derivation_trailing_slash() {
+        let base =
+            "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource/";
+        let derived = format!(
+            "{}/default/test-owner/seed-sealed",
+            workload_resource_base(base)
+        );
+        assert_eq!(
+            derived,
+            "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/workload-resource/default/test-owner/seed-sealed"
+        );
+    }
 
     #[test]
     fn test_cache_entry_valid() {
@@ -298,6 +434,75 @@ mod tests {
         };
         assert!(!entry.is_valid());
         assert!(entry.has_valid_error());
+    }
+
+    #[tokio::test]
+    async fn test_evict_kbs_cache_entry() {
+        use crate::attestation::AaTokenCache;
+        use crate::config::Config;
+        use crate::ownership::OwnershipGuard;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let config = Config::from_env_for_test();
+        let signal_dir = std::env::temp_dir().join(format!(
+            "attestation-proxy-kbs-evict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&signal_dir).unwrap();
+
+        let cache_map = {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "default/test-owner/seed-encrypted".to_string(),
+                KbsCacheEntry {
+                    body: vec![1, 2, 3],
+                    content_type: "application/octet-stream".to_string(),
+                    status: 200,
+                    expires_at: Instant::now() + Duration::from_secs(300),
+                    error: None,
+                    error_until: Instant::now(),
+                },
+            );
+            m
+        };
+
+        let state = crate::AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(cache_map)),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                "level1".to_string(),
+                signal_dir.clone(),
+            )),
+        };
+
+        // Verify entry exists before eviction
+        assert!(state
+            .kbs_resource_cache
+            .read()
+            .await
+            .contains_key("default/test-owner/seed-encrypted"));
+
+        // Evict
+        evict_kbs_cache_entry(&state, "default/test-owner/seed-encrypted").await;
+
+        // Verify entry is gone
+        assert!(!state
+            .kbs_resource_cache
+            .read()
+            .await
+            .contains_key("default/test-owner/seed-encrypted"));
+
+        // Evicting a non-existent key should not panic
+        evict_kbs_cache_entry(&state, "default/nonexistent/path").await;
+
+        let _ = std::fs::remove_dir_all(&signal_dir);
     }
 
     #[test]

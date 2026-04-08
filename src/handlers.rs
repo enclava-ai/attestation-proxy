@@ -365,9 +365,48 @@ async fn update_owner_seed_material(
             escrow::update_owner_seed_material_from_files(state, encrypted, sealed).await
         }
         "kubernetes-secret" => escrow::update_owner_seed_material(state, encrypted, sealed).await,
-        "kbs-resource" => Err(OwnershipError::Store(
-            "kbs_resource_backend_is_read_only".to_string(),
-        )),
+        "kbs-resource" => {
+            // Partial-failure note: encrypted and sealed are written sequentially.
+            // If the second write fails, the first is already committed (PUT is upsert).
+            // A retry will overwrite the partial state.
+            match encrypted {
+                EscrowValueUpdate::Keep => {}
+                EscrowValueUpdate::Remove => {
+                    kbs::delete_kbs_workload_resource(
+                        state,
+                        &state.config.owner_seed_encrypted_kbs_path,
+                    )
+                    .await?;
+                }
+                EscrowValueUpdate::Set(bytes) => {
+                    kbs::put_kbs_workload_resource(
+                        state,
+                        &state.config.owner_seed_encrypted_kbs_path,
+                        bytes,
+                    )
+                    .await?;
+                }
+            }
+            match sealed {
+                EscrowValueUpdate::Keep => {}
+                EscrowValueUpdate::Remove => {
+                    kbs::delete_kbs_workload_resource(
+                        state,
+                        &state.config.owner_seed_sealed_kbs_path,
+                    )
+                    .await?;
+                }
+                EscrowValueUpdate::Set(bytes) => {
+                    kbs::put_kbs_workload_resource(
+                        state,
+                        &state.config.owner_seed_sealed_kbs_path,
+                        bytes,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
         other => Err(OwnershipError::Store(format!(
             "unsupported_owner_ciphertext_backend:{other}"
         ))),
@@ -1038,7 +1077,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     rand::rngs::OsRng.fill_bytes(&mut challenge_bytes);
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
     let expires_at = Instant::now()
-        + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds);
+        + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds as u64);
     {
         let mut slot = state
             .bootstrap_challenge

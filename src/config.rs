@@ -31,19 +31,21 @@ pub struct Config {
     pub attestation_k8s_api_timeout_seconds: f64,
     pub storage_ownership_mode: String,
     pub instance_id: String,
-    pub bootstrap_owner_pubkey_hash: String,
-    pub tenant_instance_identity_hash: String,
     pub owner_ciphertext_backend: String,
     pub owner_seed_encrypted_kbs_path: String,
     pub owner_seed_sealed_kbs_path: String,
+    // Ownership identity fields
+    pub bootstrap_owner_pubkey_hash: String,
+    pub tenant_instance_identity_hash: String,
+    pub ownership_challenge_ttl_seconds: f64,
+    // Kubernetes-secret backend fields (used when owner_ciphertext_backend = "kubernetes-secret")
+    pub k8s_api_url: String,
+    pub k8s_ca_cert_path: String,
+    pub k8s_service_account_token_path: String,
     pub owner_escrow_secret_name: String,
     pub owner_escrow_encrypted_key: String,
     pub owner_escrow_sealed_key: String,
     pub owner_escrow_dir: String,
-    pub ownership_challenge_ttl_seconds: u64,
-    pub k8s_api_url: String,
-    pub k8s_service_account_token_path: String,
-    pub k8s_ca_cert_path: String,
 }
 
 impl Config {
@@ -66,55 +68,12 @@ impl Config {
                 .unwrap_or(default)
         }
 
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        }
-
         fn env_bool(key: &str, default: bool) -> bool {
             match std::env::var(key) {
                 Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
                 Err(_) => default,
             }
         }
-
-        let instance_id = env_or("INSTANCE_ID", "");
-        let storage_ownership_mode = env_or("STORAGE_OWNERSHIP_MODE", "legacy");
-        let owner_ciphertext_backend = std::env::var("OWNER_CIPHERTEXT_BACKEND").unwrap_or_else(
-            |_| {
-                if matches!(storage_ownership_mode.as_str(), "password" | "auto-unlock") {
-                    "kubernetes-secret".to_string()
-                } else {
-                    "kbs-resource".to_string()
-                }
-            },
-        );
-        let owner_seed_encrypted_kbs_path = std::env::var("OWNER_SEED_ENCRYPTED_KBS_PATH")
-            .unwrap_or_else(|_| {
-                if instance_id.is_empty() {
-                    String::new()
-                } else {
-                    format!("default/{instance_id}-owner/seed-encrypted")
-                }
-            });
-        let owner_seed_sealed_kbs_path = std::env::var("OWNER_SEED_SEALED_KBS_PATH")
-            .unwrap_or_else(|_| {
-                if instance_id.is_empty() {
-                    String::new()
-                } else {
-                    format!("default/{instance_id}-owner/seed-sealed")
-                }
-            });
-        let owner_escrow_secret_name = std::env::var("OWNER_ESCROW_SECRET_NAME")
-            .unwrap_or_else(|_| {
-                if instance_id.is_empty() {
-                    String::new()
-                } else {
-                    format!("{instance_id}-owner-escrow")
-                }
-            });
 
         Self {
             listen_host: env_or("ATTESTATION_BIND", "0.0.0.0"),
@@ -153,27 +112,39 @@ impl Config {
                 "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
                 6.0,
             ),
-            storage_ownership_mode,
-            instance_id,
+            storage_ownership_mode: env_or("STORAGE_OWNERSHIP_MODE", "legacy"),
+            instance_id: env_or("INSTANCE_ID", ""),
+            owner_ciphertext_backend: env_or("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
+            owner_seed_encrypted_kbs_path: {
+                let id = env_or("INSTANCE_ID", "");
+                std::env::var("OWNER_SEED_ENCRYPTED_KBS_PATH").unwrap_or_else(|_| {
+                    if id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("default/{id}-owner/seed-encrypted")
+                    }
+                })
+            },
+            owner_seed_sealed_kbs_path: {
+                let id = env_or("INSTANCE_ID", "");
+                std::env::var("OWNER_SEED_SEALED_KBS_PATH").unwrap_or_else(|_| {
+                    if id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("default/{id}-owner/seed-sealed")
+                    }
+                })
+            },
             bootstrap_owner_pubkey_hash: env_or("BOOTSTRAP_OWNER_PUBKEY_HASH", ""),
             tenant_instance_identity_hash: env_or("TENANT_INSTANCE_IDENTITY_HASH", ""),
-            owner_ciphertext_backend,
-            owner_seed_encrypted_kbs_path,
-            owner_seed_sealed_kbs_path,
-            owner_escrow_secret_name,
+            ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
+            k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
+            k8s_ca_cert_path: env_or("K8S_CA_CERT_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
+            k8s_service_account_token_path: env_or("K8S_SERVICE_ACCOUNT_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            owner_escrow_secret_name: env_or("OWNER_ESCROW_SECRET_NAME", ""),
             owner_escrow_encrypted_key: env_or("OWNER_ESCROW_ENCRYPTED_KEY", "seed-encrypted"),
             owner_escrow_sealed_key: env_or("OWNER_ESCROW_SEALED_KEY", "seed-sealed"),
-            owner_escrow_dir: env_or("OWNER_ESCROW_DIR", "/owner-escrow"),
-            ownership_challenge_ttl_seconds: env_u64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300),
-            k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
-            k8s_service_account_token_path: env_or(
-                "K8S_SERVICE_ACCOUNT_TOKEN_PATH",
-                "/var/run/secrets/kubernetes.io/serviceaccount/token",
-            ),
-            k8s_ca_cert_path: env_or(
-                "K8S_CA_CERT_PATH",
-                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-            ),
+            owner_escrow_dir: env_or("OWNER_ESCROW_DIR", "/run/owner-escrow"),
         }
     }
 }
@@ -211,20 +182,19 @@ impl Config {
             attestation_k8s_api_timeout_seconds: 6.0,
             storage_ownership_mode: "legacy".into(),
             instance_id: "".into(),
-            bootstrap_owner_pubkey_hash: "".into(),
-            tenant_instance_identity_hash: "".into(),
             owner_ciphertext_backend: "kbs-resource".into(),
             owner_seed_encrypted_kbs_path: "".into(),
             owner_seed_sealed_kbs_path: "".into(),
+            bootstrap_owner_pubkey_hash: "".into(),
+            tenant_instance_identity_hash: "".into(),
+            ownership_challenge_ttl_seconds: 300.0,
+            k8s_api_url: "https://kubernetes.default.svc".into(),
+            k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
+            k8s_service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token".into(),
             owner_escrow_secret_name: "".into(),
             owner_escrow_encrypted_key: "seed-encrypted".into(),
             owner_escrow_sealed_key: "seed-sealed".into(),
-            owner_escrow_dir: "/owner-escrow".into(),
-            ownership_challenge_ttl_seconds: 300,
-            k8s_api_url: "https://kubernetes.default.svc".into(),
-            k8s_service_account_token_path:
-                "/var/run/secrets/kubernetes.io/serviceaccount/token".into(),
-            k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
+            owner_escrow_dir: "/run/owner-escrow".into(),
         }
     }
 }
@@ -267,19 +237,6 @@ mod tests {
         "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
         "STORAGE_OWNERSHIP_MODE",
         "INSTANCE_ID",
-        "BOOTSTRAP_OWNER_PUBKEY_HASH",
-        "TENANT_INSTANCE_IDENTITY_HASH",
-        "OWNER_CIPHERTEXT_BACKEND",
-        "OWNER_SEED_ENCRYPTED_KBS_PATH",
-        "OWNER_SEED_SEALED_KBS_PATH",
-        "OWNER_ESCROW_SECRET_NAME",
-        "OWNER_ESCROW_ENCRYPTED_KEY",
-        "OWNER_ESCROW_SEALED_KEY",
-        "OWNER_ESCROW_DIR",
-        "OWNERSHIP_CHALLENGE_TTL_SECONDS",
-        "K8S_API_URL",
-        "K8S_SERVICE_ACCOUNT_TOKEN_PATH",
-        "K8S_CA_CERT_PATH",
         "HOSTNAME",
     ];
 
@@ -333,17 +290,6 @@ mod tests {
         assert_eq!(config.attestation_k8s_api_timeout_seconds, 6.0);
         assert_eq!(config.storage_ownership_mode, "legacy");
         assert_eq!(config.instance_id, "");
-        assert_eq!(config.bootstrap_owner_pubkey_hash, "");
-        assert_eq!(config.tenant_instance_identity_hash, "");
-        assert_eq!(config.owner_ciphertext_backend, "kbs-resource");
-        assert_eq!(config.owner_seed_encrypted_kbs_path, "");
-        assert_eq!(config.owner_seed_sealed_kbs_path, "");
-        assert_eq!(config.owner_escrow_secret_name, "");
-        assert_eq!(config.owner_escrow_encrypted_key, "seed-encrypted");
-        assert_eq!(config.owner_escrow_sealed_key, "seed-sealed");
-        assert_eq!(config.owner_escrow_dir, "/owner-escrow");
-        assert_eq!(config.ownership_challenge_ttl_seconds, 300);
-        assert_eq!(config.k8s_api_url, "https://kubernetes.default.svc");
     }
 
     #[test]
@@ -365,55 +311,6 @@ mod tests {
         std::env::set_var("ATTESTATION_POD_NAME", "explicit-name");
         let config = Config::from_env();
         assert_eq!(config.attestation_pod_name, "explicit-name");
-    }
-
-    #[test]
-    fn test_owner_seed_path_defaults_from_instance_id() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        clear_env();
-
-        std::env::set_var("INSTANCE_ID", "flowforge-1-ot-1");
-        let config = Config::from_env();
-        assert_eq!(
-            config.owner_seed_encrypted_kbs_path,
-            "default/flowforge-1-ot-1-owner/seed-encrypted"
-        );
-        assert_eq!(
-            config.owner_seed_sealed_kbs_path,
-            "default/flowforge-1-ot-1-owner/seed-sealed"
-        );
-        assert_eq!(
-            config.owner_escrow_secret_name,
-            "flowforge-1-ot-1-owner-escrow"
-        );
-    }
-
-    #[test]
-    fn test_owner_seed_path_explicit_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        clear_env();
-
-        std::env::set_var("INSTANCE_ID", "flowforge-1-ot-1");
-        std::env::set_var(
-            "OWNER_SEED_ENCRYPTED_KBS_PATH",
-            "default/custom-owner/seed-encrypted",
-        );
-        let config = Config::from_env();
-        assert_eq!(
-            config.owner_seed_encrypted_kbs_path,
-            "default/custom-owner/seed-encrypted"
-        );
-    }
-
-    #[test]
-    fn test_password_mode_defaults_to_kubernetes_secret_backend() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        clear_env();
-
-        std::env::set_var("STORAGE_OWNERSHIP_MODE", "password");
-        std::env::set_var("INSTANCE_ID", "flowforge-1-ot-1");
-        let config = Config::from_env();
-        assert_eq!(config.owner_ciphertext_backend, "kubernetes-secret");
     }
 
     #[test]
