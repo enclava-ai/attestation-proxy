@@ -1,7 +1,8 @@
 /// KBS resource fetch and per-path caching.
 ///
-/// Ports Python's KBS resource handling: cache read/write with per-path TTL,
-/// bearer token authentication, and error caching.
+/// Ports Python's KBS resource handling: cache read/write with per-path TTL
+/// and error caching. Resource reads use the local AA/CDH passthrough so the
+/// caller receives plaintext resource bytes rather than KBS-wrapped ciphertext.
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -29,6 +30,18 @@ impl KbsCacheEntry {
     pub fn has_valid_error(&self) -> bool {
         self.error.is_some() && Instant::now() < self.error_until
     }
+}
+
+fn cdh_resource_base(aa_token_url: &str, aa_evidence_url: &str) -> String {
+    if let Some((base, _)) = aa_token_url.split_once("/aa/token") {
+        return format!("{}/cdh/resource", base.trim_end_matches('/'));
+    }
+
+    if let Some((base, _)) = aa_evidence_url.split_once("/aa/evidence") {
+        return format!("{}/cdh/resource", base.trim_end_matches('/'));
+    }
+
+    "http://127.0.0.1:8006/cdh/resource".to_string()
 }
 
 /// Check cache for a resource entry. Returns (entry_body_data, error_payload).
@@ -123,35 +136,16 @@ pub async fn fetch_kbs_resource(
         return Err((502, error));
     }
 
-    // Get bearer token
-    let token = match fetch_kbs_bearer_token(state).await {
-        Ok(t) => t,
-        Err(e) => {
-            let error_payload = json!({
-                "error": "kbs_token_unavailable",
-                "detail": e,
-                "timestamp": utc_now(),
-            });
-            store_resource_error(
-                &mut cache,
-                cache_key,
-                error_payload.clone(),
-                state.config.kbs_resource_failure_cache_seconds,
-            );
-            return Err((502, error_payload));
-        }
-    };
-
     let resource_url = format!(
         "{}/{}",
-        state.config.kbs_resource_url.trim_end_matches('/'),
+        cdh_resource_base(&state.config.aa_token_url, &state.config.aa_evidence_url)
+            .trim_end_matches('/'),
         cache_key
     );
 
     let result = state
         .http_client
         .get(&resource_url)
-        .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/octet-stream")
         .timeout(Duration::from_secs(20))
         .send()
@@ -168,10 +162,7 @@ pub async fn fetch_kbs_resource(
                 .to_string();
 
             if upstream_status != 200 {
-                let error_body = resp
-                    .text()
-                    .await
-                    .unwrap_or_default();
+                let error_body = resp.text().await.unwrap_or_default();
                 let error_payload = json!({
                     "error": "kbs_resource_non_200",
                     "upstream_status": upstream_status,
@@ -222,11 +213,7 @@ pub async fn fetch_kbs_resource(
             // Check if it's an HTTP error (status code available) vs connection error
             let (error_type, upstream_status, upstream_body) = if e.is_status() {
                 let status = e.status().map(|s| s.as_u16());
-                (
-                    "kbs_resource_http_error",
-                    status,
-                    Some(e.to_string()),
-                )
+                ("kbs_resource_http_error", status, Some(e.to_string()))
             } else {
                 ("kbs_resource_unreachable", None, None)
             };
@@ -357,6 +344,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_cdh_resource_base_from_aa_token_url() {
+        let base = cdh_resource_base(
+            "http://127.0.0.1:8006/aa/token?token_type=kbs",
+            "http://127.0.0.1:8006/aa/evidence",
+        );
+        assert_eq!(base, "http://127.0.0.1:8006/cdh/resource");
+    }
+
+    #[test]
+    fn test_cdh_resource_base_from_aa_evidence_url() {
+        let base = cdh_resource_base(
+            "http://invalid-token-url",
+            "http://127.0.0.1:8006/aa/evidence",
+        );
+        assert_eq!(base, "http://127.0.0.1:8006/cdh/resource");
+    }
+
+    #[test]
     fn test_workload_resource_url_derivation() {
         let base =
             "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource";
@@ -373,11 +378,11 @@ mod tests {
     #[test]
     fn test_workload_resource_url_derivation_no_trailing_resource() {
         let base = "http://kbs:8080/kbs/v0/custom";
-        let derived = format!(
-            "{}/default/owner/seed",
-            workload_resource_base(base)
+        let derived = format!("{}/default/owner/seed", workload_resource_base(base));
+        assert_eq!(
+            derived,
+            "http://kbs:8080/kbs/v0/custom/workload-resource/default/owner/seed"
         );
-        assert_eq!(derived, "http://kbs:8080/kbs/v0/custom/workload-resource/default/owner/seed");
     }
 
     #[test]
@@ -480,6 +485,7 @@ mod tests {
                 "level1".to_string(),
                 signal_dir.clone(),
             )),
+            bootstrap_challenge: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Verify entry exists before eviction
