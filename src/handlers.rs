@@ -280,6 +280,16 @@ fn is_optional_sealed_owner_seed_resource_missing(error_json: &Value) -> bool {
     )
 }
 
+#[cfg(test)]
+const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 5;
+
+#[cfg(test)]
+const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 10;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 2_000;
+
 fn validate_bootstrap_signature(
     challenge_b64: &str,
     bootstrap_pubkey: &str,
@@ -361,6 +371,57 @@ async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial,
     }
 }
 
+async fn refresh_ownership_state(
+    state: &AppState,
+    force_refresh: bool,
+) -> Result<(), OwnershipError> {
+    if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
+        return Ok(());
+    }
+
+    if force_refresh && state.config.owner_ciphertext_backend == "kbs-resource" {
+        kbs::evict_kbs_cache_entry(state, state.config.owner_seed_encrypted_kbs_path.trim()).await;
+        kbs::evict_kbs_cache_entry(state, state.config.owner_seed_sealed_kbs_path.trim()).await;
+    }
+
+    let material = load_owner_seed_material(state).await?;
+    let claimed = material.encrypted.is_some();
+    state
+        .ownership
+        .set_auto_unlock_enabled(material.sealed.is_some());
+    if claimed {
+        if state.ownership.is_auto_unlock_mode() && material.sealed.is_some() {
+            state.ownership.set_unlocking();
+        } else {
+            state.ownership.set_locked();
+        }
+    } else {
+        state.ownership.set_unclaimed();
+    }
+    Ok(())
+}
+
+async fn maybe_refresh_unclaimed_state(state: &AppState) {
+    if !state.ownership.is_unclaimed() {
+        return;
+    }
+    if let Err(err) = refresh_ownership_state(state, true).await {
+        state.ownership.set_error(err.to_string());
+    }
+}
+
+async fn load_owner_seed_material_with_revalidation(
+    state: &AppState,
+) -> Result<OwnerSeedMaterial, OwnershipError> {
+    let material = load_owner_seed_material(state).await?;
+    if material.encrypted.is_some() || state.config.owner_ciphertext_backend != "kbs-resource" {
+        return Ok(material);
+    }
+
+    refresh_ownership_state(state, true).await?;
+    load_owner_seed_material(state).await
+}
+
 async fn update_owner_seed_material(
     state: &AppState,
     encrypted: EscrowValueUpdate<'_>,
@@ -434,6 +495,7 @@ pub async fn status(State(state): State<AppState>) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
+    maybe_refresh_unclaimed_state(&state).await;
     let mut body = state.ownership.state_json();
     let identity = fetch_ownership_identity(&state).await;
     body["instance_id"] = json!(state.config.instance_id);
@@ -722,23 +784,27 @@ pub async fn initialize_ownership_state(state: &AppState) {
         return;
     }
 
-    match load_owner_seed_material(state).await {
-        Ok(material) => {
-            let claimed = material.encrypted.is_some();
-            state
-                .ownership
-                .set_auto_unlock_enabled(material.sealed.is_some());
-            if claimed {
-                if state.ownership.is_auto_unlock_mode() && material.sealed.is_some() {
-                    state.ownership.set_unlocking();
-                } else {
-                    state.ownership.set_locked();
+    for attempt in 0..OWNER_SEED_STARTUP_RECHECK_ATTEMPTS {
+        match refresh_ownership_state(state, attempt > 0).await {
+            Ok(()) => {
+                if !state.ownership.is_unclaimed() {
+                    return;
                 }
-            } else {
-                state.ownership.set_unclaimed();
+                if state.config.owner_ciphertext_backend != "kbs-resource"
+                    || attempt + 1 == OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
+                ))
+                .await;
+            }
+            Err(err) => {
+                state.ownership.set_error(err.to_string());
+                return;
             }
         }
-        Err(err) => state.ownership.set_error(err.to_string()),
     }
 }
 
@@ -795,6 +861,7 @@ pub async fn unlock(State(state): State<AppState>, Json(payload): Json<UnlockReq
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
+    maybe_refresh_unclaimed_state(&state).await;
     if state.ownership.is_unclaimed() {
         return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
     }
@@ -895,7 +962,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
         }
     };
 
-    let owner_seed_resource = match load_owner_seed_material(state).await {
+    let owner_seed_resource = match load_owner_seed_material_with_revalidation(state).await {
         Ok(material) => match material.encrypted {
             Some(resource) => resource,
             None => {
@@ -1055,6 +1122,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
+    maybe_refresh_unclaimed_state(&state).await;
     if !state.ownership.is_unclaimed() {
         return json_response(
             409,
@@ -1104,6 +1172,7 @@ pub async fn bootstrap_claim(
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
+    maybe_refresh_unclaimed_state(&state).await;
     if !state.ownership.is_unclaimed() {
         return json_response(
             409,
@@ -1246,7 +1315,7 @@ pub async fn change_password(
         return json_response(400, &json!({"error": "password_required"}));
     }
 
-    let material = match load_owner_seed_material(&state).await {
+    let material = match load_owner_seed_material_with_revalidation(&state).await {
         Ok(material) if material.encrypted.is_some() => material,
         Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
         Err(err) => {
@@ -1406,7 +1475,7 @@ pub async fn enable_auto_unlock(
     if password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
     }
-    let material = match load_owner_seed_material(&state).await {
+    let material = match load_owner_seed_material_with_revalidation(&state).await {
         Ok(material) if material.encrypted.is_some() => material,
         Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
         Err(err) => {
@@ -1488,7 +1557,7 @@ pub async fn disable_auto_unlock(
     if password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
     }
-    let material = match load_owner_seed_material(&state).await {
+    let material = match load_owner_seed_material_with_revalidation(&state).await {
         Ok(material) if material.encrypted.is_some() => material,
         Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
         Err(err) => {
@@ -1607,6 +1676,46 @@ mod tests {
         assert!(!is_optional_sealed_owner_seed_resource_missing(&json!({
             "upstream_status": 401
         })));
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_retries_transient_unclaimed_reads() {
+        let signal_dir = test_signal_dir("initialize-ownership-state-retries");
+        let owner_seed = [0x55; 32];
+        let mut resources = HashMap::new();
+        resources.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            owner_seed_envelope_json(owner_seed, "correct-password", "instance-test-01"),
+        );
+        let mut sequences = HashMap::new();
+        sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![500],
+        );
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            resources,
+            sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("locked")
+        );
     }
 
     #[tokio::test]
@@ -2320,6 +2429,7 @@ mod tests {
         aa_token_response: Value,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
+        cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
     }
 
     struct TestApiServer {
@@ -2372,6 +2482,26 @@ mod tests {
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
     ) -> impl IntoResponse {
+        if let Some(status) = state
+            .cdh_status_sequences
+            .lock()
+            .expect("cdh status sequence lock poisoned")
+            .get_mut(&path)
+            .and_then(|statuses| {
+                if statuses.is_empty() {
+                    None
+                } else {
+                    Some(statuses.remove(0))
+                }
+            })
+        {
+            return (
+                StatusCode::from_u16(status).expect("valid transient status"),
+                Json(json!({"error": "transient"})),
+            )
+                .into_response();
+        }
+
         let resources = state
             .kbs_resources
             .lock()
@@ -2391,11 +2521,22 @@ mod tests {
         aa_claims: Value,
         kbs_resources: HashMap<String, String>,
     ) -> TestApiServer {
+        spawn_test_api_server_with_sequences(owner_secret, aa_claims, kbs_resources, HashMap::new())
+            .await
+    }
+
+    async fn spawn_test_api_server_with_sequences(
+        owner_secret: Value,
+        aa_claims: Value,
+        kbs_resources: HashMap<String, String>,
+        cdh_status_sequences: HashMap<String, Vec<u16>>,
+    ) -> TestApiServer {
         let owner_secret = Arc::new(Mutex::new(owner_secret));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
             owner_secret: owner_secret.clone(),
             kbs_resources: Arc::new(Mutex::new(kbs_resources)),
+            cdh_status_sequences: Arc::new(Mutex::new(cdh_status_sequences)),
         };
         let router = Router::new()
             .route(

@@ -527,12 +527,30 @@ pub fn extract_init_data_hash(claims: &Value) -> Option<String> {
 
 fn extract_init_data_claim_field(claims: &Value, field: &str) -> Option<String> {
     let dynamic_paths = [
+        vec!["identity", field],
+        vec!["init_data", "identity", field],
         vec!["init_data_claims", "identity", field],
+        vec!["init_data", field],
         vec!["init_data_claims", field],
         vec![
             "submods",
             "cpu0",
             "ear.veraison.annotated-evidence",
+            "identity",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "init_data",
+            "identity",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
             "init_data_claims",
             "identity",
             field,
@@ -556,6 +574,56 @@ fn extract_init_data_claim_field(claims: &Value, field: &str) -> Option<String> 
             "cpu0",
             "ear.veraison.annotated-evidence.init_data_claims",
             field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data",
+            "identity",
+            field,
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data",
+            field,
+        ],
+    ];
+    let document_paths = [
+        vec!["identity.toml"],
+        vec!["init_data", "identity.toml"],
+        vec!["init_data_claims", "identity.toml"],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "identity.toml",
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "init_data",
+            "identity.toml",
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence",
+            "init_data_claims",
+            "identity.toml",
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data",
+            "identity.toml",
+        ],
+        vec![
+            "submods",
+            "cpu0",
+            "ear.veraison.annotated-evidence.init_data_claims",
+            "identity.toml",
         ],
     ];
 
@@ -569,6 +637,34 @@ fn extract_init_data_claim_field(claims: &Value, field: &str) -> Option<String> 
         }
     }
 
+    for parts in document_paths {
+        if let Some(val) = path_get(claims, &parts) {
+            if let Some(doc) = val.as_str() {
+                if let Some(parsed) = extract_field_from_identity_document(doc, field) {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_field_from_identity_document(document: &str, field: &str) -> Option<String> {
+    for line in document.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (key, value) = trimmed.split_once('=')?;
+        if key.trim() != field {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
     None
 }
 
@@ -904,6 +1000,50 @@ mod tests {
         let candidates = find_jwt_candidates(&data);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0], jwt);
+    }
+
+    #[test]
+    fn test_extract_init_data_claim_field_supports_identity_toml_shape() {
+        let claims = json!({
+            "submods": {
+                "cpu0": {
+                    "ear.veraison.annotated-evidence": {
+                        "init_data": {
+                            "identity.toml": r#"
+bootstrap_owner_pubkey_hash = "bootstrap-hash"
+tenant_instance_identity_hash = "identity-hash"
+"#
+                        },
+                        "init_data_claims": {
+                            "agent_policy_claims": {
+                                "containers": [
+                                    {
+                                        "OCI": {
+                                            "Annotations": {
+                                                "io.kubernetes.container.name": "workload",
+                                                "io.kubernetes.cri.image-name": "ghcr.io/example/workload@sha256:abc",
+                                                "io.kubernetes.pod.namespace": "flowforge-1",
+                                                "io.kubernetes.pod.service-account.name": "flowforge-workload"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_bootstrap_owner_pubkey_hash(&claims).as_deref(),
+            Some("bootstrap-hash")
+        );
+        assert_eq!(
+            extract_tenant_instance_identity_hash(&claims).as_deref(),
+            Some("identity-hash")
+        );
+        assert_eq!(extract_attested_containers(&claims).len(), 1);
     }
 
     #[test]
