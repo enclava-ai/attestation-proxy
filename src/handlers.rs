@@ -267,17 +267,69 @@ fn bootstrap_pubkey_hash_matches(expected: &str, raw_pubkey: &[u8]) -> bool {
 fn is_missing_owner_seed_resource(error_json: &Value) -> bool {
     matches!(
         error_json.get("upstream_status").and_then(Value::as_u64),
-        // AA/CDH currently surfaces a missing owner-seed resource as 500 even
-        // though the underlying KBS read is a 404.
-        Some(404) | Some(500)
+        Some(404)
     )
 }
 
 fn is_optional_sealed_owner_seed_resource_missing(error_json: &Value) -> bool {
     matches!(
         error_json.get("upstream_status").and_then(Value::as_u64),
-        Some(404) | Some(500)
+        Some(404)
     )
+}
+
+fn owner_seed_unavailable_error(error_json: &Value) -> OwnershipError {
+    OwnershipError::OwnerSeedUnavailable(
+        error_json
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("owner_seed_fetch_failed")
+            .to_string(),
+    )
+}
+
+async fn cdh_missing_owner_seed_resource(
+    state: &AppState,
+    resource_path: &str,
+    error_json: &Value,
+) -> Result<bool, OwnershipError> {
+    if is_missing_owner_seed_resource(error_json) {
+        return Ok(true);
+    }
+
+    if error_json.get("upstream_status").and_then(Value::as_u64) != Some(500) {
+        return Ok(false);
+    }
+
+    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+        404 => Ok(true),
+        200 => Ok(false),
+        status => Err(OwnershipError::OwnerSeedUnavailable(format!(
+            "owner_seed_probe_unexpected_status:{status}"
+        ))),
+    }
+}
+
+async fn cdh_missing_optional_sealed_owner_seed_resource(
+    state: &AppState,
+    resource_path: &str,
+    error_json: &Value,
+) -> Result<bool, OwnershipError> {
+    if is_optional_sealed_owner_seed_resource_missing(error_json) {
+        return Ok(true);
+    }
+
+    if error_json.get("upstream_status").and_then(Value::as_u64) != Some(500) {
+        return Ok(false);
+    }
+
+    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+        404 => Ok(true),
+        200 => Ok(false),
+        status => Err(OwnershipError::OwnerSeedUnavailable(format!(
+            "owner_seed_sealed_probe_unexpected_status:{status}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -329,15 +381,18 @@ async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial,
             .await
             {
                 Ok((body, _, _)) => Some(body),
-                Err((_status, error_json)) if is_missing_owner_seed_resource(&error_json) => None,
                 Err((_status, error_json)) => {
-                    return Err(OwnershipError::OwnerSeedUnavailable(
-                        error_json
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("owner_seed_fetch_failed")
-                            .to_string(),
-                    ))
+                    if cdh_missing_owner_seed_resource(
+                        state,
+                        state.config.owner_seed_encrypted_kbs_path.trim(),
+                        &error_json,
+                    )
+                    .await?
+                    {
+                        None
+                    } else {
+                        return Err(owner_seed_unavailable_error(&error_json));
+                    }
                 }
             };
             let sealed = match kbs::fetch_kbs_resource(
@@ -347,20 +402,18 @@ async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial,
             .await
             {
                 Ok((body, _, _)) => Some(body),
-                // AA/CDH currently surfaces an absent optional sealed copy as 500.
-                Err((_status, error_json))
-                    if is_optional_sealed_owner_seed_resource_missing(&error_json) =>
-                {
-                    None
-                }
                 Err((_status, error_json)) => {
-                    return Err(OwnershipError::OwnerSeedUnavailable(
-                        error_json
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("owner_seed_fetch_failed")
-                            .to_string(),
-                    ))
+                    if cdh_missing_optional_sealed_owner_seed_resource(
+                        state,
+                        state.config.owner_seed_sealed_kbs_path.trim(),
+                        &error_json,
+                    )
+                    .await?
+                    {
+                        None
+                    } else {
+                        return Err(owner_seed_unavailable_error(&error_json));
+                    }
                 }
             };
             Ok(OwnerSeedMaterial { encrypted, sealed })
@@ -801,6 +854,15 @@ pub async fn initialize_ownership_state(state: &AppState) {
                 .await;
             }
             Err(err) => {
+                if state.config.owner_ciphertext_backend == "kbs-resource"
+                    && attempt + 1 < OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
+                    ))
+                    .await;
+                    continue;
+                }
                 state.ownership.set_error(err.to_string());
                 return;
             }
@@ -1665,11 +1727,11 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     #[test]
-    fn missing_owner_seed_resource_accepts_404_and_500() {
+    fn missing_owner_seed_resource_accepts_only_404() {
         assert!(is_missing_owner_seed_resource(
             &json!({"upstream_status": 404})
         ));
-        assert!(is_missing_owner_seed_resource(
+        assert!(!is_missing_owner_seed_resource(
             &json!({"upstream_status": 500})
         ));
         assert!(!is_missing_owner_seed_resource(
@@ -1678,11 +1740,11 @@ mod tests {
     }
 
     #[test]
-    fn optional_sealed_owner_seed_resource_accepts_404_and_500() {
+    fn optional_sealed_owner_seed_resource_accepts_only_404() {
         assert!(is_optional_sealed_owner_seed_resource_missing(&json!({
             "upstream_status": 404
         })));
-        assert!(is_optional_sealed_owner_seed_resource_missing(&json!({
+        assert!(!is_optional_sealed_owner_seed_resource_missing(&json!({
             "upstream_status": 500
         })));
         assert!(!is_optional_sealed_owner_seed_resource_missing(&json!({
@@ -1727,6 +1789,40 @@ mod tests {
                 .get("state")
                 .and_then(Value::as_str),
             Some("locked")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_keeps_unclaimed_when_cdh_reports_500_for_missing_seed() {
+        let signal_dir = test_signal_dir("initialize-ownership-state-unclaimed-after-cdh-500");
+        let mut sequences = HashMap::new();
+        sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![500],
+        );
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unclaimed")
         );
     }
 
@@ -2581,7 +2677,7 @@ mod tests {
         (StatusCode::OK, Json(secret))
     }
 
-    async fn get_kbs_resource(
+    async fn get_cdh_kbs_resource(
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
     ) -> impl IntoResponse {
@@ -2605,6 +2701,20 @@ mod tests {
                 .into_response();
         }
 
+        let resources = state
+            .kbs_resources
+            .lock()
+            .expect("kbs resource lock poisoned");
+        match resources.get(&path) {
+            Some(body) => (StatusCode::OK, body.clone()).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
+        }
+    }
+
+    async fn get_direct_kbs_resource(
+        AxumState(state): AxumState<TestApiState>,
+        AxumPath(path): AxumPath<String>,
+    ) -> impl IntoResponse {
         let resources = state
             .kbs_resources
             .lock()
@@ -2646,8 +2756,8 @@ mod tests {
                 "/api/v1/namespaces/tenant-test/secrets/instance-test-01-owner-escrow",
                 get(get_owner_secret).put(put_owner_secret),
             )
-            .route("/cdh/resource/{*path}", get(get_kbs_resource))
-            .route("/kbs/v0/resource/{*path}", get(get_kbs_resource))
+            .route("/cdh/resource/{*path}", get(get_cdh_kbs_resource))
+            .route("/kbs/v0/resource/{*path}", get(get_direct_kbs_resource))
             .route("/aa/token", get(test_aa_token_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

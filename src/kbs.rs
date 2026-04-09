@@ -241,6 +241,36 @@ pub async fn fetch_kbs_resource(
     }
 }
 
+/// Probe the direct KBS resource endpoint with bearer auth and return its HTTP status.
+/// This is used to classify CDH passthrough failures for owner-seed reads without
+/// relying on AA/CDH's current "500 for missing resource" behavior.
+pub async fn probe_direct_kbs_resource_status(
+    state: &crate::AppState,
+    resource_path: &str,
+) -> Result<u16, OwnershipError> {
+    let token = fetch_kbs_bearer_token(state)
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
+
+    let resource_url = format!(
+        "{}/{}",
+        state.config.kbs_resource_url.trim_end_matches('/'),
+        resource_path.trim_start_matches('/'),
+    );
+
+    let response = state
+        .http_client
+        .get(&resource_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/octet-stream")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| OwnershipError::Store(format!("kbs_resource_probe_failed:{e}")))?;
+
+    Ok(response.status().as_u16())
+}
+
 /// Evict a cached KBS resource entry after a write or delete.
 /// This ensures read-after-write consistency for paths that were
 /// modified via the workload-resource endpoint.
