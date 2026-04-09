@@ -475,6 +475,35 @@ async fn load_owner_seed_material_with_revalidation(
     load_owner_seed_material(state).await
 }
 
+async fn apply_kbs_owner_seed_update(
+    state: &AppState,
+    resource_path: &str,
+    update: EscrowValueUpdate<'_>,
+) -> Result<bool, OwnershipError> {
+    match update {
+        EscrowValueUpdate::Keep => Ok(false),
+        EscrowValueUpdate::Remove => {
+            kbs::delete_kbs_workload_resource(state, resource_path).await?;
+            Ok(true)
+        }
+        EscrowValueUpdate::Set(bytes) => {
+            kbs::put_kbs_workload_resource(state, resource_path, bytes).await?;
+            Ok(true)
+        }
+    }
+}
+
+async fn restore_kbs_owner_seed_resource(
+    state: &AppState,
+    resource_path: &str,
+    previous: Option<&[u8]>,
+) -> Result<(), OwnershipError> {
+    match previous {
+        Some(bytes) => kbs::put_kbs_workload_resource(state, resource_path, bytes).await,
+        None => kbs::delete_kbs_workload_resource(state, resource_path).await,
+    }
+}
+
 async fn update_owner_seed_material(
     state: &AppState,
     encrypted: EscrowValueUpdate<'_>,
@@ -486,44 +515,35 @@ async fn update_owner_seed_material(
         }
         "kubernetes-secret" => escrow::update_owner_seed_material(state, encrypted, sealed).await,
         "kbs-resource" => {
-            // Partial-failure note: encrypted and sealed are written sequentially.
-            // If the second write fails, the first is already committed (PUT is upsert).
-            // A retry will overwrite the partial state.
-            match encrypted {
-                EscrowValueUpdate::Keep => {}
-                EscrowValueUpdate::Remove => {
-                    kbs::delete_kbs_workload_resource(
+            let previous = load_owner_seed_material(state).await?;
+            let encrypted_changed = apply_kbs_owner_seed_update(
+                state,
+                &state.config.owner_seed_encrypted_kbs_path,
+                encrypted,
+            )
+            .await?;
+
+            if let Err(err) =
+                apply_kbs_owner_seed_update(state, &state.config.owner_seed_sealed_kbs_path, sealed)
+                    .await
+            {
+                if encrypted_changed {
+                    if let Err(rollback_err) = restore_kbs_owner_seed_resource(
                         state,
                         &state.config.owner_seed_encrypted_kbs_path,
+                        previous.encrypted.as_deref(),
                     )
-                    .await?;
+                    .await
+                    {
+                        return Err(OwnershipError::Store(format!(
+                            "owner_seed_update_failed:{err}; rollback_failed:{rollback_err}"
+                        )));
+                    }
                 }
-                EscrowValueUpdate::Set(bytes) => {
-                    kbs::put_kbs_workload_resource(
-                        state,
-                        &state.config.owner_seed_encrypted_kbs_path,
-                        bytes,
-                    )
-                    .await?;
-                }
-            }
-            match sealed {
-                EscrowValueUpdate::Keep => {}
-                EscrowValueUpdate::Remove => {
-                    kbs::delete_kbs_workload_resource(
-                        state,
-                        &state.config.owner_seed_sealed_kbs_path,
-                    )
-                    .await?;
-                }
-                EscrowValueUpdate::Set(bytes) => {
-                    kbs::put_kbs_workload_resource(
-                        state,
-                        &state.config.owner_seed_sealed_kbs_path,
-                        bytes,
-                    )
-                    .await?;
-                }
+
+                return Err(OwnershipError::Store(format!(
+                    "owner_seed_update_failed:{err}"
+                )));
             }
             Ok(())
         }
@@ -1704,10 +1724,11 @@ mod tests {
     };
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
+    use axum::body::Bytes;
     use axum::extract::{Path as AxumPath, State as AxumState};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use axum::routing::{get, put};
     use axum::Router;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
@@ -2492,6 +2513,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kbs_resource_update_rolls_back_first_write_when_second_operation_fails() {
+        let signal_dir = test_signal_dir("kbs-resource-rollback");
+        let old_encrypted =
+            owner_seed_envelope_json([0x61; 32], "old-password", "instance-test-01");
+        let old_sealed = json!({"sealed": "old"}).to_string();
+        let new_encrypted =
+            owner_seed_envelope_json([0x62; 32], "new-password", "instance-test-01");
+
+        let mut resources = HashMap::new();
+        resources.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            old_encrypted.clone(),
+        );
+        resources.insert(
+            "default/instance-test-01-owner/seed-sealed".to_string(),
+            old_sealed.clone(),
+        );
+
+        let mut workload_resource_status_sequences = HashMap::new();
+        workload_resource_status_sequences.insert(
+            "DELETE default/instance-test-01-owner/seed-sealed".to_string(),
+            vec![500],
+        );
+
+        let api_server = spawn_test_api_server_with_all_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            resources,
+            HashMap::new(),
+            workload_resource_status_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        let err = update_owner_seed_material(
+            &state,
+            EscrowValueUpdate::Set(new_encrypted.as_bytes()),
+            EscrowValueUpdate::Remove,
+        )
+        .await
+        .expect_err("second write should fail");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("owner_seed_update_failed"),
+            "rollback path should add failure context: {err_text}"
+        );
+        assert_eq!(
+            api_server.kbs_resource("default/instance-test-01-owner/seed-encrypted"),
+            Some(old_encrypted),
+            "encrypted resource should be restored after rollback"
+        );
+        assert_eq!(
+            api_server.kbs_resource("default/instance-test-01-owner/seed-sealed"),
+            Some(old_sealed),
+            "sealed resource should remain untouched when the second operation fails"
+        );
+    }
+
     fn build_state(signal_dir: &PathBuf) -> AppState {
         build_state_with_mode(signal_dir, "level1", "http://127.0.0.1:9".to_string(), None)
     }
@@ -2629,12 +2715,14 @@ mod tests {
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
         cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        workload_resource_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
     }
 
     struct TestApiServer {
         addr: SocketAddr,
         task: tokio::task::JoinHandle<()>,
         owner_secret: Arc<Mutex<Value>>,
+        kbs_resources: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl TestApiServer {
@@ -2647,6 +2735,14 @@ mod tests {
                 .lock()
                 .expect("owner secret lock poisoned")
                 .clone()
+        }
+
+        fn kbs_resource(&self, path: &str) -> Option<String> {
+            self.kbs_resources
+                .lock()
+                .expect("kbs resource lock poisoned")
+                .get(path)
+                .cloned()
         }
     }
 
@@ -2725,6 +2821,74 @@ mod tests {
         }
     }
 
+    async fn put_workload_kbs_resource(
+        AxumState(state): AxumState<TestApiState>,
+        AxumPath(path): AxumPath<String>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let sequence_key = format!("PUT {path}");
+        if let Some(status) = state
+            .workload_resource_status_sequences
+            .lock()
+            .expect("workload status sequence lock poisoned")
+            .get_mut(&sequence_key)
+            .and_then(|statuses| {
+                if statuses.is_empty() {
+                    None
+                } else {
+                    Some(statuses.remove(0))
+                }
+            })
+        {
+            return (
+                StatusCode::from_u16(status).expect("valid transient status"),
+                Json(json!({"error": "transient"})),
+            )
+                .into_response();
+        }
+
+        let body = String::from_utf8(body.to_vec()).expect("utf-8 workload body");
+        state
+            .kbs_resources
+            .lock()
+            .expect("kbs resource lock poisoned")
+            .insert(path, body.clone());
+        (StatusCode::OK, body).into_response()
+    }
+
+    async fn delete_workload_kbs_resource(
+        AxumState(state): AxumState<TestApiState>,
+        AxumPath(path): AxumPath<String>,
+    ) -> impl IntoResponse {
+        let sequence_key = format!("DELETE {path}");
+        if let Some(status) = state
+            .workload_resource_status_sequences
+            .lock()
+            .expect("workload status sequence lock poisoned")
+            .get_mut(&sequence_key)
+            .and_then(|statuses| {
+                if statuses.is_empty() {
+                    None
+                } else {
+                    Some(statuses.remove(0))
+                }
+            })
+        {
+            return (
+                StatusCode::from_u16(status).expect("valid transient status"),
+                Json(json!({"error": "transient"})),
+            )
+                .into_response();
+        }
+
+        state
+            .kbs_resources
+            .lock()
+            .expect("kbs resource lock poisoned")
+            .remove(&path);
+        StatusCode::OK.into_response()
+    }
+
     async fn test_aa_token_handler(AxumState(state): AxumState<TestApiState>) -> Json<Value> {
         Json(state.aa_token_response.clone())
     }
@@ -2744,12 +2908,33 @@ mod tests {
         kbs_resources: HashMap<String, String>,
         cdh_status_sequences: HashMap<String, Vec<u16>>,
     ) -> TestApiServer {
+        spawn_test_api_server_with_all_sequences(
+            owner_secret,
+            aa_claims,
+            kbs_resources,
+            cdh_status_sequences,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    async fn spawn_test_api_server_with_all_sequences(
+        owner_secret: Value,
+        aa_claims: Value,
+        kbs_resources: HashMap<String, String>,
+        cdh_status_sequences: HashMap<String, Vec<u16>>,
+        workload_resource_status_sequences: HashMap<String, Vec<u16>>,
+    ) -> TestApiServer {
         let owner_secret = Arc::new(Mutex::new(owner_secret));
+        let kbs_resources = Arc::new(Mutex::new(kbs_resources));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
             owner_secret: owner_secret.clone(),
-            kbs_resources: Arc::new(Mutex::new(kbs_resources)),
+            kbs_resources: kbs_resources.clone(),
             cdh_status_sequences: Arc::new(Mutex::new(cdh_status_sequences)),
+            workload_resource_status_sequences: Arc::new(Mutex::new(
+                workload_resource_status_sequences,
+            )),
         };
         let router = Router::new()
             .route(
@@ -2758,6 +2943,10 @@ mod tests {
             )
             .route("/cdh/resource/{*path}", get(get_cdh_kbs_resource))
             .route("/kbs/v0/resource/{*path}", get(get_direct_kbs_resource))
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                put(put_workload_kbs_resource).delete(delete_workload_kbs_resource),
+            )
             .route("/aa/token", get(test_aa_token_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2773,6 +2962,7 @@ mod tests {
             addr,
             task,
             owner_secret,
+            kbs_resources,
         }
     }
 
