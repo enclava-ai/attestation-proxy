@@ -1,11 +1,13 @@
 /// AA token fetch, caching, and JWT claim extraction.
 ///
-/// Ports Python's AA token fetch with retry+backoff+cache, JWT parsing
-/// without signature verification, and all claim extraction functions.
+/// Ports Python's AA token fetch with retry+backoff+cache and all claim
+/// extraction functions. Ownership-critical paths verify the AA token
+/// signature before using its claims.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use regex::Regex;
 use serde_json::{json, Value};
 use tokio::time::Instant;
@@ -58,6 +60,29 @@ pub fn parse_jwt_payload(token: &str) -> Option<Value> {
         Some(parsed)
     } else {
         None
+    }
+}
+
+/// Verify a JWT using the inline JWK carried in the header and return its claims.
+pub fn verify_jwt_claims(token: &str) -> Result<Value, String> {
+    if !jwt_re().is_match(token) {
+        return Err("invalid_jwt_format".to_string());
+    }
+
+    let header = decode_header(token).map_err(|err| format!("jwt_header_decode_failed:{err}"))?;
+    let jwk = header
+        .jwk
+        .as_ref()
+        .ok_or_else(|| "jwt_jwk_missing".to_string())?;
+    let decoding_key =
+        DecodingKey::from_jwk(jwk).map_err(|err| format!("jwt_decoding_key_failed:{err}"))?;
+    let token_data = decode::<Value>(token, &decoding_key, &Validation::new(header.alg))
+        .map_err(|err| format!("jwt_verify_failed:{err}"))?;
+
+    if token_data.claims.is_object() {
+        Ok(token_data.claims)
+    } else {
+        Err("jwt_claims_not_object".to_string())
     }
 }
 
@@ -140,7 +165,7 @@ impl AaTokenCache {
             if t.is_empty() {
                 None
             } else {
-                parse_jwt_payload(t)
+                verify_jwt_claims(t).ok()
             }
         });
         let ttl = token_cache_ttl_seconds(&claims, config);
@@ -282,6 +307,7 @@ pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
         "claims_root": null,
         "measurement": null,
         "error": null,
+        "verified": false,
     });
 
     let (payload, payload_error) = fetch_aa_token_payload(state).await;
@@ -304,17 +330,18 @@ pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let parsed = parse_jwt_payload(token);
+    let parsed = verify_jwt_claims(token);
     match parsed {
-        Some(claims) => {
+        Ok(claims) => {
             let measurement = extract_measurement_from_claims(&claims);
             result["claims_root"] = claims;
+            result["verified"] = Value::Bool(true);
             if let Some(m) = measurement {
                 result["measurement"] = Value::String(m);
             }
         }
-        None => {
-            result["error"] = Value::String("aa_token_missing_or_invalid_jwt".into());
+        Err(err) => {
+            result["error"] = Value::String(err);
         }
     }
 
@@ -725,15 +752,36 @@ pub fn extract_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::jwk::{
+        AlgorithmParameters, CommonParameters, Jwk, KeyAlgorithm, OctetKeyParameters, OctetKeyType,
+    };
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    fn signed_test_jwt(claims: &Value) -> String {
+        let secret = b"attestation-proxy-attestation-tests";
+        let encoding_key = EncodingKey::from_secret(secret);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some("JWT".to_string());
+        header.jwk = Some(Jwk {
+            common: CommonParameters {
+                key_algorithm: Some(KeyAlgorithm::HS256),
+                ..Default::default()
+            },
+            algorithm: AlgorithmParameters::OctetKey(OctetKeyParameters {
+                key_type: OctetKeyType::Octet,
+                value: URL_SAFE_NO_PAD.encode(secret),
+            }),
+        });
+        encode(&header, claims, &encoding_key).expect("encode signed jwt")
+    }
 
     #[test]
     fn test_parse_jwt_payload_valid() {
-        // Create a valid 3-part JWT with base64url-encoded JSON payload
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"sub":"1234","name":"test","exp":9999999999}"#);
-        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fakesig");
-        let token = format!("{header}.{payload}.{sig}");
+        let token = signed_test_jwt(&json!({
+            "sub": "1234",
+            "name": "test",
+            "exp": 9999999999u64,
+        }));
 
         let result = parse_jwt_payload(&token).unwrap();
         assert_eq!(result["sub"], "1234");
@@ -747,6 +795,31 @@ mod tests {
         assert!(parse_jwt_payload("not-a-jwt").is_none());
         assert!(parse_jwt_payload("two.parts").is_none());
         assert!(parse_jwt_payload("has spaces.in.it").is_none());
+    }
+
+    #[test]
+    fn test_verify_jwt_claims_valid() {
+        let token = signed_test_jwt(&json!({
+            "sub": "verified",
+            "exp": 9999999999u64,
+        }));
+
+        let result = verify_jwt_claims(&token).expect("verify signed jwt");
+        assert_eq!(result["sub"], "verified");
+    }
+
+    #[test]
+    fn test_verify_jwt_claims_rejects_tampering() {
+        let token = signed_test_jwt(&json!({
+            "sub": "verified",
+            "exp": 9999999999u64,
+        }));
+        let mut parts: Vec<String> = token.split('.').map(ToString::to_string).collect();
+        parts[1] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"tampered","exp":9999999999}"#);
+        let tampered = parts.join(".");
+
+        assert!(verify_jwt_claims(&tampered).is_err());
     }
 
     #[test]

@@ -195,6 +195,7 @@ struct OwnershipIdentity {
     instance_id: Option<String>,
     bootstrap_owner_pubkey_hash: Option<String>,
     tenant_instance_identity_hash: Option<String>,
+    claims_verified: bool,
     claims_error: Option<String>,
 }
 
@@ -204,27 +205,24 @@ async fn fetch_ownership_identity(state: &AppState) -> OwnershipIdentity {
         .get("error")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let claims_verified = token_claims
+        .get("verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let claims = token_claims
         .get("claims_root")
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let bootstrap_owner_pubkey_hash = attestation::extract_bootstrap_owner_pubkey_hash(&claims)
-        .or_else(|| {
-            (!state.config.bootstrap_owner_pubkey_hash.is_empty())
-                .then(|| state.config.bootstrap_owner_pubkey_hash.clone())
-        });
-    let tenant_instance_identity_hash = attestation::extract_tenant_instance_identity_hash(&claims)
-        .or_else(|| {
-            (!state.config.tenant_instance_identity_hash.is_empty())
-                .then(|| state.config.tenant_instance_identity_hash.clone())
-        });
+    let bootstrap_owner_pubkey_hash = attestation::extract_bootstrap_owner_pubkey_hash(&claims);
+    let tenant_instance_identity_hash = attestation::extract_tenant_instance_identity_hash(&claims);
 
     OwnershipIdentity {
         tenant_id: attestation::extract_tenant_id(&claims),
         instance_id: attestation::extract_instance_id(&claims),
         bootstrap_owner_pubkey_hash,
         tenant_instance_identity_hash,
+        claims_verified,
         claims_error: error,
     }
 }
@@ -444,6 +442,7 @@ pub async fn status(State(state): State<AppState>) -> Response {
     body["claims_instance_id"] = json!(identity.instance_id);
     body["bootstrap_owner_pubkey_hash"] = json!(identity.bootstrap_owner_pubkey_hash);
     body["tenant_instance_identity_hash"] = json!(identity.tenant_instance_identity_hash);
+    body["claims_verified"] = json!(identity.claims_verified);
     body["claims_error"] = json!(identity.claims_error);
     json_response(200, &body)
 }
@@ -1570,6 +1569,10 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signer, SigningKey};
+    use jsonwebtoken::jwk::{
+        AlgorithmParameters, CommonParameters, Jwk, KeyAlgorithm, OctetKeyParameters, OctetKeyType,
+    };
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -2505,16 +2508,30 @@ mod tests {
     }
 
     fn jwt_for_claims(claims: &Value) -> String {
-        let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-        let payload =
-            BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("serialize claims"));
-        let token = format!(
-            "{header}.{payload}.{}",
-            BASE64_URL_SAFE_NO_PAD.encode(b"sig")
-        );
+        let secret = b"attestation-proxy-test-secret";
+        let encoding_key = EncodingKey::from_secret(secret);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some("JWT".to_string());
+        header.jwk = Some(Jwk {
+            common: CommonParameters {
+                key_algorithm: Some(KeyAlgorithm::HS256),
+                ..Default::default()
+            },
+            algorithm: AlgorithmParameters::OctetKey(OctetKeyParameters {
+                key_type: OctetKeyType::Octet,
+                value: URL_SAFE_NO_PAD.encode(secret),
+            }),
+        });
+        let mut token_claims = claims.clone();
+        if let Some(object) = token_claims.as_object_mut() {
+            object
+                .entry("exp".to_string())
+                .or_insert_with(|| json!(9999999999u64));
+        }
+        let token = encode(&header, &token_claims, &encoding_key).expect("encode signed test jwt");
         assert!(
-            crate::attestation::parse_jwt_payload(&token).is_some(),
-            "test jwt must parse"
+            crate::attestation::verify_jwt_claims(&token).is_ok(),
+            "test jwt must verify"
         );
         token
     }

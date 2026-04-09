@@ -14,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 regex = "1"
+jsonwebtoken = "9"
 percent-encoding = "2"
 argon2 = "0.5"
 hkdf = "0.12"

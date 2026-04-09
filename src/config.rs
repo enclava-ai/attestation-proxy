@@ -1,7 +1,7 @@
 /// Typed configuration parsed from environment variables at startup.
 ///
-/// All 27 env vars match the Python server.py reference implementation
-/// (lines 39-65, 83-88) with identical names and defaults.
+/// All env vars match the Python server.py reference implementation
+/// with ownership-mode additions for the Rust implementation.
 pub struct Config {
     pub listen_host: String,
     pub listen_port: u16,
@@ -34,9 +34,6 @@ pub struct Config {
     pub owner_ciphertext_backend: String,
     pub owner_seed_encrypted_kbs_path: String,
     pub owner_seed_sealed_kbs_path: String,
-    // Ownership identity fields
-    pub bootstrap_owner_pubkey_hash: String,
-    pub tenant_instance_identity_hash: String,
     pub ownership_challenge_ttl_seconds: f64,
     // Kubernetes-secret backend fields (used when owner_ciphertext_backend = "kubernetes-secret")
     pub k8s_api_url: String,
@@ -135,8 +132,6 @@ impl Config {
                     }
                 })
             },
-            bootstrap_owner_pubkey_hash: env_or("BOOTSTRAP_OWNER_PUBKEY_HASH", ""),
-            tenant_instance_identity_hash: env_or("TENANT_INSTANCE_IDENTITY_HASH", ""),
             ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
             k8s_ca_cert_path: env_or(
@@ -193,8 +188,6 @@ impl Config {
             owner_ciphertext_backend: "kbs-resource".into(),
             owner_seed_encrypted_kbs_path: "".into(),
             owner_seed_sealed_kbs_path: "".into(),
-            bootstrap_owner_pubkey_hash: "".into(),
-            tenant_instance_identity_hash: "".into(),
             ownership_challenge_ttl_seconds: 300.0,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
