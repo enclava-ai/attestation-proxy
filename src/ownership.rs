@@ -502,6 +502,7 @@ impl OwnershipGuard {
         &self,
         keys: &OwnerVolumeKeys,
     ) -> Result<(), OwnershipError> {
+        self.clear_password_handoff_key_files()?;
         self.write_slot_handoff_key(SIGNAL_APP_DATA_SLOT, &keys.app_data)?;
         self.write_slot_handoff_key(SIGNAL_TLS_DATA_SLOT, &keys.tls_data)?;
         Ok(())
@@ -522,6 +523,39 @@ impl OwnershipGuard {
         file.sync_all()
             .map_err(|err| OwnershipError::Filesystem(err.to_string()))?;
         Ok(())
+    }
+
+    fn clear_slot_handoff_files(
+        &self,
+        slots: &[&str],
+        names: &[&str],
+    ) -> Result<(), OwnershipError> {
+        for slot in slots {
+            let slot_dir = self.signal_dir.join(slot);
+            for name in names {
+                let path = slot_dir.join(name);
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(OwnershipError::Filesystem(err.to_string())),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_password_handoff_key_files(&self) -> Result<(), OwnershipError> {
+        self.clear_slot_handoff_files(
+            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
+            &[SIGNAL_KEY_FILE],
+        )
+    }
+
+    pub fn clear_password_handoff_retry_files(&self) -> Result<(), OwnershipError> {
+        self.clear_slot_handoff_files(
+            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
+            &[SIGNAL_KEY_FILE, SIGNAL_ERROR_FILE],
+        )
     }
 
     pub fn poll_handoff_result(&self, timeout_secs: u64) -> Result<HandoffOutcome, OwnershipError> {
@@ -669,6 +703,10 @@ impl OwnershipGuard {
 
     pub fn is_unclaimed(&self) -> bool {
         matches!(self.current_state(), OwnershipState::Unclaimed)
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        matches!(self.current_state(), OwnershipState::Unlocked)
     }
 
     pub fn auto_unlock_enabled(&self) -> bool {

@@ -1082,6 +1082,18 @@ async fn unlock_owner_seed_material(
     render_password_handoff_outcome(state, outcome, owner_seed).await
 }
 
+async fn finalize_rewrapped_owner_seed(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    if state.ownership.is_unlocked() {
+        state.ownership.clear_password_handoff_retry_files()?;
+        state.ownership.set_unlocked();
+        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+    }
+    unlock_owner_seed_material(state, owner_seed).await
+}
+
 async fn render_password_handoff_outcome(
     state: &AppState,
     outcome: HandoffOutcome,
@@ -1446,7 +1458,7 @@ pub async fn recover(
         );
     }
 
-    match unlock_owner_seed_material(&state, &owner_seed).await {
+    match finalize_rewrapped_owner_seed(&state, &owner_seed).await {
         Ok(warning) => {
             let owner_pubkey = state
                 .ownership
@@ -2206,6 +2218,97 @@ mod tests {
             decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
             Err(OwnershipError::WrongPassword)
         );
+    }
+
+    #[tokio::test]
+    async fn recover_while_unlocked_clears_stale_password_handoff_files() {
+        let signal_dir = test_signal_dir("recover-already-unlocked");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-already-unlocked-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "initial-password").await;
+        let mnemonic = claim
+            .get("owner_seed_mnemonic")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+        let enable = enable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: "initial-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(enable.status().as_u16(), 200);
+
+        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
+            let slot_dir = signal_dir.path.join(slot);
+            fs::write(slot_dir.join(SIGNAL_KEY_FILE), "stale-key").expect("write stale key");
+            fs::write(slot_dir.join(SIGNAL_ERROR_FILE), "stale-error").expect("write stale error");
+        }
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic,
+                new_password: "recovered-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("recovered")
+        );
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
+
+        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
+            let slot_dir = signal_dir.path.join(slot);
+            assert!(
+                !slot_dir.join(SIGNAL_KEY_FILE).exists(),
+                "recover should clear stale key file for {slot}"
+            );
+            assert!(
+                !slot_dir.join(SIGNAL_ERROR_FILE).exists(),
+                "recover should clear stale error file for {slot}"
+            );
+            assert!(
+                slot_dir.join(SIGNAL_UNLOCKED_FILE).exists(),
+                "recover should preserve unlocked sentinel for {slot}"
+            );
+        }
+
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        assert!(
+            decode_secret_field(&secret, "seed-sealed").is_some(),
+            "recover should preserve the sealed owner-seed copy in auto-unlock mode"
+        );
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+        let _ = decrypt_owner_seed_with_password(&state, &encrypted, "recovered-password");
     }
 
     #[tokio::test]
