@@ -100,9 +100,8 @@ fn write_atomic(path: &Path, key: &str, bytes: &[u8]) -> Result<(), OwnershipErr
     tmp_file
         .sync_all()
         .map_err(|err| OwnershipError::Store(format!("owner_escrow_sync_failed:{key}:{err}")))?;
-    fs::rename(&tmp_path, path).map_err(|err| {
-        OwnershipError::Store(format!("owner_escrow_rename_failed:{key}:{err}"))
-    })?;
+    fs::rename(&tmp_path, path)
+        .map_err(|err| OwnershipError::Store(format!("owner_escrow_rename_failed:{key}:{err}")))?;
     sync_parent_dir(path, key)
 }
 
@@ -112,7 +111,9 @@ fn sync_parent_dir(path: &Path, key: &str) -> Result<(), OwnershipError> {
         .ok_or_else(|| OwnershipError::Store(format!("owner_escrow_parent_missing:{key}")))?;
     File::open(parent)
         .and_then(|dir| dir.sync_all())
-        .map_err(|err| OwnershipError::Store(format!("owner_escrow_parent_sync_failed:{key}:{err}")))
+        .map_err(|err| {
+            OwnershipError::Store(format!("owner_escrow_parent_sync_failed:{key}:{err}"))
+        })
 }
 
 fn build_kube_client(config: &crate::config::Config) -> Result<reqwest::Client, OwnershipError> {
@@ -140,7 +141,9 @@ fn owner_secret_name(config: &crate::config::Config) -> Result<String, Ownership
         config.owner_escrow_secret_name.clone()
     };
     if name.is_empty() {
-        return Err(OwnershipError::Store("owner_escrow_secret_name_missing".to_string()));
+        return Err(OwnershipError::Store(
+            "owner_escrow_secret_name_missing".to_string(),
+        ));
     }
     Ok(name)
 }
@@ -167,9 +170,7 @@ fn read_service_account_token(config: &crate::config::Config) -> Result<String, 
         .map_err(|err| OwnershipError::Store(format!("k8s_token_read_failed:{err}")))
 }
 
-async fn fetch_secret(
-    state: &crate::AppState,
-) -> Result<SecretObject, OwnershipError> {
+async fn fetch_secret(state: &crate::AppState) -> Result<SecretObject, OwnershipError> {
     let client = build_kube_client(&state.config)?;
     let token = read_service_account_token(&state.config)?;
     let url = owner_secret_url(&state.config)?;
@@ -182,7 +183,9 @@ async fn fetch_secret(
         .map_err(|err| OwnershipError::Store(format!("k8s_secret_get_failed:{err}")))?;
 
     if response.status().as_u16() == 404 {
-        return Err(OwnershipError::Store("owner_escrow_secret_missing".to_string()));
+        return Err(OwnershipError::Store(
+            "owner_escrow_secret_missing".to_string(),
+        ));
     }
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -198,10 +201,7 @@ async fn fetch_secret(
         .map_err(|err| OwnershipError::Store(format!("k8s_secret_parse_failed:{err}")))
 }
 
-async fn put_secret(
-    state: &crate::AppState,
-    secret: &SecretObject,
-) -> Result<(), OwnershipError> {
+async fn put_secret(state: &crate::AppState, secret: &SecretObject) -> Result<(), OwnershipError> {
     let client = build_kube_client(&state.config)?;
     let token = read_service_account_token(&state.config)?;
     let url = owner_secret_url(&state.config)?;
@@ -231,7 +231,9 @@ fn decode_secret_value(
         Some(encoded) => BASE64_STANDARD
             .decode(encoded.as_bytes())
             .map(Some)
-            .map_err(|err| OwnershipError::Store(format!("k8s_secret_base64_decode_failed:{key}:{err}"))),
+            .map_err(|err| {
+                OwnershipError::Store(format!("k8s_secret_base64_decode_failed:{key}:{err}"))
+            }),
         None => Ok(None),
     }
 }
@@ -251,13 +253,9 @@ pub async fn load_owner_seed_material_from_files(
 ) -> Result<OwnerSeedMaterial, OwnershipError> {
     let encrypted_path =
         owner_escrow_file_path(&state.config, &state.config.owner_escrow_encrypted_key)?;
-    let sealed_path =
-        owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
+    let sealed_path = owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
     Ok(OwnerSeedMaterial {
-        encrypted: read_optional_file(
-            &encrypted_path,
-            &state.config.owner_escrow_encrypted_key,
-        )?,
+        encrypted: read_optional_file(&encrypted_path, &state.config.owner_escrow_encrypted_key)?,
         sealed: read_optional_file(&sealed_path, &state.config.owner_escrow_sealed_key)?,
     })
 }
@@ -305,8 +303,7 @@ pub async fn update_owner_seed_material_from_files(
 ) -> Result<(), OwnershipError> {
     let encrypted_path =
         owner_escrow_file_path(&state.config, &state.config.owner_escrow_encrypted_key)?;
-    let sealed_path =
-        owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
+    let sealed_path = owner_escrow_file_path(&state.config, &state.config.owner_escrow_sealed_key)?;
 
     match encrypted {
         EscrowValueUpdate::Keep => {}
@@ -319,10 +316,7 @@ pub async fn update_owner_seed_material_from_files(
                     )));
                 }
             } else {
-                sync_parent_dir(
-                    &encrypted_path,
-                    &state.config.owner_escrow_encrypted_key,
-                )?;
+                sync_parent_dir(&encrypted_path, &state.config.owner_escrow_encrypted_key)?;
             }
         }
         EscrowValueUpdate::Set(bytes) => write_atomic(

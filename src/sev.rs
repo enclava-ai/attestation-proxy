@@ -44,8 +44,8 @@ fn ioctl_lock() -> &'static Mutex<()> {
 }
 
 fn parse_proc_misc_minor(name: &str) -> Result<Option<u32>, String> {
-    let contents = fs::read_to_string("/proc/misc")
-        .map_err(|err| format!("proc_misc_read_failed:{err}"))?;
+    let contents =
+        fs::read_to_string("/proc/misc").map_err(|err| format!("proc_misc_read_failed:{err}"))?;
     for line in contents.lines() {
         let mut parts = line.split_whitespace();
         let minor = parts.next();
@@ -129,13 +129,18 @@ pub fn derive_measurement_policy_key() -> Result<[u8; 32], String> {
 
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), SNP_GET_DERIVED_KEY as _, &mut guest_req) };
     if rc != 0 {
-        return Err(format!("sev_guest_ioctl_failed:{}", io::Error::last_os_error()));
+        return Err(format!(
+            "sev_guest_ioctl_failed:{}",
+            io::Error::last_os_error()
+        ));
     }
 
     let fw_error = extract_fw_error(guest_req.exitinfo2);
     let vmm_error = extract_vmm_error(guest_req.exitinfo2);
     if fw_error != 0 || vmm_error != 0 {
-        return Err(format!("sev_guest_derived_key_error:fw={fw_error}:vmm={vmm_error}"));
+        return Err(format!(
+            "sev_guest_derived_key_error:fw={fw_error}:vmm={vmm_error}"
+        ));
     }
 
     let mut first = [0u8; 32];

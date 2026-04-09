@@ -50,9 +50,7 @@ pub fn parse_jwt_payload(token: &str) -> Option<Value> {
     let padded = pad_b64(payload_part);
     let decoded = URL_SAFE_NO_PAD
         .decode(payload_part.as_bytes())
-        .or_else(|_| {
-            base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes())
-        })
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes()))
         .ok()?;
     let text = std::str::from_utf8(&decoded).ok()?;
     let parsed: Value = serde_json::from_str(text).ok()?;
@@ -76,9 +74,7 @@ pub fn nonce_is_valid_b64(nonce: &str) -> bool {
 
 /// Normalize a SHA-256 reference: extract `sha256:<64hex>` and lowercase it.
 pub fn normalize_sha256(value: &str) -> Option<String> {
-    sha256_re()
-        .find(value)
-        .map(|m| m.as_str().to_lowercase())
+    sha256_re().find(value).map(|m| m.as_str().to_lowercase())
 }
 
 /// Extract digest from an image reference string.
@@ -196,9 +192,7 @@ fn token_cache_ttl_seconds(claims: &Option<Value>, config: &Config) -> f64 {
 /// Fetch the AA token payload with retry and caching.
 /// Returns (payload, error). Holds the write lock across the entire fetch
 /// to match Python's serialization behavior.
-pub async fn fetch_aa_token_payload(
-    state: &crate::AppState,
-) -> (Option<Value>, Option<String>) {
+pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, Option<String>) {
     let mut cache = state.aa_token_cache.write().await;
 
     // Check cache first
@@ -267,9 +261,7 @@ pub async fn fetch_aa_token_payload(
 }
 
 /// Fetch a bearer token string for KBS requests.
-pub async fn fetch_kbs_bearer_token(
-    state: &crate::AppState,
-) -> Result<String, String> {
+pub async fn fetch_kbs_bearer_token(state: &crate::AppState) -> Result<String, String> {
     let (payload, error) = fetch_aa_token_payload(state).await;
     if let Some(e) = error {
         return Err(e);
@@ -285,9 +277,7 @@ pub async fn fetch_kbs_bearer_token(
 }
 
 /// Fetch token claims for attestation. Returns JSON with claims_root, measurement, error.
-pub async fn fetch_kbs_token_claims(
-    state: &crate::AppState,
-) -> Value {
+pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
     let mut result = json!({
         "claims_root": null,
         "measurement": null,
@@ -633,7 +623,10 @@ pub fn extract_attested_workload(claims: &Value, workload_container: &str) -> Va
 }
 
 /// Select the best claims root from evidence JSON and supplemental (AA token) claims.
-pub fn select_claims_root(evidence_json: &Value, supplemental_claims: Option<&Value>) -> (Value, String) {
+pub fn select_claims_root(
+    evidence_json: &Value,
+    supplemental_claims: Option<&Value>,
+) -> (Value, String) {
     let mut claims_root = json!({});
     let mut claims_source = "none".to_string();
 
@@ -676,7 +669,12 @@ pub fn select_claims_root(evidence_json: &Value, supplemental_claims: Option<&Va
 }
 
 /// Extract all claims from evidence JSON and optional supplemental claims.
-pub fn extract_claims(evidence_json: &Value, supplemental_claims: Option<&Value>, attestation_profile: &str, workload_container: &str) -> Value {
+pub fn extract_claims(
+    evidence_json: &Value,
+    supplemental_claims: Option<&Value>,
+    attestation_profile: &str,
+    workload_container: &str,
+) -> Value {
     let (claims_root, claims_source) = select_claims_root(evidence_json, supplemental_claims);
 
     let report = evidence_json
@@ -731,8 +729,7 @@ mod tests {
     #[test]
     fn test_parse_jwt_payload_valid() {
         // Create a valid 3-part JWT with base64url-encoded JSON payload
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"alg":"RS256"}"#);
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"sub":"1234","name":"test","exp":9999999999}"#);
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fakesig");
@@ -818,10 +815,8 @@ mod tests {
 
     #[test]
     fn test_find_jwt_candidates() {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"alg":"RS256"}"#);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"sub":"1"}"#);
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"1"}"#);
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("sig");
         let jwt = format!("{header}.{payload}.{sig}");
 
@@ -841,21 +836,34 @@ mod tests {
     #[test]
     fn test_normalize_sha256() {
         assert_eq!(
-            normalize_sha256("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
-            Some("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string())
+            normalize_sha256(
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            ),
+            Some(
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string()
+            )
         );
         assert_eq!(normalize_sha256("no-sha-here"), None);
         // Uppercase should be lowercased
         assert_eq!(
-            normalize_sha256("sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"),
-            Some("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string())
+            normalize_sha256(
+                "sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+            ),
+            Some(
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string()
+            )
         );
     }
 
     #[test]
     fn test_to_hex_bytes() {
         // Array of ints
-        assert_eq!(to_hex_bytes(&json!([0, 1, 255])), Some("0001ff".to_string()));
+        assert_eq!(
+            to_hex_bytes(&json!([0, 1, 255])),
+            Some("0001ff".to_string())
+        );
         // Hex string
         assert_eq!(to_hex_bytes(&json!("abcdef")), Some("abcdef".to_string()));
         // Non-hex string

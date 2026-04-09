@@ -5,8 +5,8 @@ use base64::Engine as _;
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
-use serde_json::{json, Value};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -305,7 +305,11 @@ impl OwnershipGuard {
 
             let mut stretched = Zeroizing::new([0u8; 32]);
             argon2
-                .hash_password_into(password.as_slice(), salt.as_slice(), stretched.as_mut_slice())
+                .hash_password_into(
+                    password.as_slice(),
+                    salt.as_slice(),
+                    stretched.as_mut_slice(),
+                )
                 .map_err(|err| OwnershipError::Kdf(err.to_string()))?;
 
             let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), stretched.as_slice());
@@ -422,28 +426,19 @@ impl OwnershipGuard {
         Ok(SigningKey::from_bytes(&signing_seed))
     }
 
-    pub fn owner_public_key_b64url(
-        &self,
-        owner_seed: &[u8; 32],
-    ) -> Result<String, OwnershipError> {
+    pub fn owner_public_key_b64url(&self, owner_seed: &[u8; 32]) -> Result<String, OwnershipError> {
         let signing_key = self.derive_owner_signing_key(owner_seed)?;
         let verifying_key: VerifyingKey = signing_key.verifying_key();
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying_key.as_bytes()))
     }
 
-    pub fn owner_seed_mnemonic(
-        &self,
-        owner_seed: &[u8; 32],
-    ) -> Result<String, OwnershipError> {
+    pub fn owner_seed_mnemonic(&self, owner_seed: &[u8; 32]) -> Result<String, OwnershipError> {
         Mnemonic::from_entropy_in(Language::English, owner_seed)
             .map(|mnemonic| mnemonic.to_string())
             .map_err(|err| OwnershipError::Envelope(format!("mnemonic_encode_failed:{err}")))
     }
 
-    pub fn owner_seed_from_mnemonic(
-        &self,
-        mnemonic: &str,
-    ) -> Result<[u8; 32], OwnershipError> {
+    pub fn owner_seed_from_mnemonic(&self, mnemonic: &str) -> Result<[u8; 32], OwnershipError> {
         let parsed = Mnemonic::parse_in_normalized(Language::English, mnemonic)
             .map_err(|err| OwnershipError::Envelope(format!("mnemonic_parse_failed:{err}")))?;
         let entropy = parsed.to_entropy();
@@ -458,25 +453,26 @@ impl OwnershipGuard {
         Ok(owner_seed)
     }
 
-    pub fn derive_sealing_wrap_key(
-        &self,
-        instance_id: &str,
-    ) -> Result<[u8; 32], OwnershipError> {
+    pub fn derive_sealing_wrap_key(&self, instance_id: &str) -> Result<[u8; 32], OwnershipError> {
         if instance_id.is_empty() {
             return Err(OwnershipError::InstanceIdMissing);
         }
         #[cfg(test)]
         let base_key = {
             let digest = Sha256::digest(
-                [b"attestation-proxy-test-seal-key-v1:".as_slice(), instance_id.as_bytes()]
-                    .concat(),
+                [
+                    b"attestation-proxy-test-seal-key-v1:".as_slice(),
+                    instance_id.as_bytes(),
+                ]
+                .concat(),
             );
             let mut key = [0u8; 32];
             key.copy_from_slice(&digest[..32]);
             key
         };
         #[cfg(not(test))]
-        let base_key = crate::sev::derive_measurement_policy_key().map_err(OwnershipError::Store)?;
+        let base_key =
+            crate::sev::derive_measurement_policy_key().map_err(OwnershipError::Store)?;
         let salt = Sha256::digest(instance_id.as_bytes());
         let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), &base_key);
         let mut derived = [0u8; 32];
@@ -486,7 +482,8 @@ impl OwnershipGuard {
     }
 
     pub fn write_handoff_key(&self, key: &[u8; 32]) -> Result<(), OwnershipError> {
-        fs::create_dir_all(&self.signal_dir).map_err(|err| OwnershipError::Filesystem(err.to_string()))?;
+        fs::create_dir_all(&self.signal_dir)
+            .map_err(|err| OwnershipError::Filesystem(err.to_string()))?;
         let key_path = self.signal_dir.join(SIGNAL_KEY_FILE);
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -501,7 +498,10 @@ impl OwnershipGuard {
         Ok(())
     }
 
-    pub fn write_password_handoff_keys(&self, keys: &OwnerVolumeKeys) -> Result<(), OwnershipError> {
+    pub fn write_password_handoff_keys(
+        &self,
+        keys: &OwnerVolumeKeys,
+    ) -> Result<(), OwnershipError> {
         self.write_slot_handoff_key(SIGNAL_APP_DATA_SLOT, &keys.app_data)?;
         self.write_slot_handoff_key(SIGNAL_TLS_DATA_SLOT, &keys.tls_data)?;
         Ok(())
@@ -509,8 +509,7 @@ impl OwnershipGuard {
 
     fn write_slot_handoff_key(&self, slot: &str, key: &[u8; 32]) -> Result<(), OwnershipError> {
         let slot_dir = self.signal_dir.join(slot);
-        fs::create_dir_all(&slot_dir)
-            .map_err(|err| OwnershipError::Filesystem(err.to_string()))?;
+        fs::create_dir_all(&slot_dir).map_err(|err| OwnershipError::Filesystem(err.to_string()))?;
         let key_path = slot_dir.join(SIGNAL_KEY_FILE);
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -564,10 +563,7 @@ impl OwnershipGuard {
         &self,
         timeout_secs: u64,
     ) -> Result<HandoffOutcome, OwnershipError> {
-        self.poll_slot_handoff_result(
-            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
-            timeout_secs,
-        )
+        self.poll_slot_handoff_result(&[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT], timeout_secs)
     }
 
     fn poll_slot_handoff_result(
@@ -716,10 +712,7 @@ impl OwnershipGuard {
     }
 
     fn current_state(&self) -> OwnershipState {
-        self.machine
-            .lock()
-            .expect("ownership lock poisoned")
-            .state
+        self.machine.lock().expect("ownership lock poisoned").state
     }
 
     fn now() -> Instant {
@@ -797,16 +790,14 @@ mod tests {
             OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
 
         assert!(guard.begin_unlock_attempt().is_ok());
-        assert_eq!(
-            guard.begin_unlock_attempt(),
-            Err(OwnershipError::NotLocked)
-        );
+        assert_eq!(guard.begin_unlock_attempt(), Err(OwnershipError::NotLocked));
 
         guard.set_locked_after_retry();
         assert!(guard.begin_unlock_attempt().is_ok());
 
         let signal_dir = test_signal_dir("state-machine-rate-limit");
-        let guard = OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
+        let guard =
+            OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
         for _ in 0..UNLOCK_MAX_ATTEMPTS {
             assert!(guard.begin_unlock_attempt().is_ok());
             guard.set_locked_after_retry();
@@ -820,13 +811,17 @@ mod tests {
     #[test]
     fn kdf_parity_and_zeroize() {
         let signal_dir = test_signal_dir("kdf");
-        let guard = OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
+        let guard =
+            OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
 
         let mut password = Zeroizing::new(b"password123".to_vec());
         let key = guard
             .derive_luks_key(&mut password, "instance-abc")
             .expect("kdf should succeed");
-        assert_eq!(to_hex(&key), "53713008dae51be0b32cb3815404c355483bc629703f80f26095ede6144c1182");
+        assert_eq!(
+            to_hex(&key),
+            "53713008dae51be0b32cb3815404c355483bc629703f80f26095ede6144c1182"
+        );
         assert_eq!(key.len(), 32);
     }
 
@@ -881,25 +876,41 @@ mod tests {
             .expect("write password slot keys");
 
         assert_eq!(
-            fs::read(signal_dir.path.join(SIGNAL_APP_DATA_SLOT).join(SIGNAL_KEY_FILE))
-                .expect("read app-data key"),
+            fs::read(
+                signal_dir
+                    .path
+                    .join(SIGNAL_APP_DATA_SLOT)
+                    .join(SIGNAL_KEY_FILE)
+            )
+            .expect("read app-data key"),
             keys.app_data.to_vec()
         );
         assert_eq!(
-            fs::read(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT).join(SIGNAL_KEY_FILE))
-                .expect("read tls-data key"),
+            fs::read(
+                signal_dir
+                    .path
+                    .join(SIGNAL_TLS_DATA_SLOT)
+                    .join(SIGNAL_KEY_FILE)
+            )
+            .expect("read tls-data key"),
             keys.tls_data.to_vec()
         );
 
         fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
         fs::create_dir_all(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT)).expect("create tls slot");
         fs::write(
-            signal_dir.path.join(SIGNAL_APP_DATA_SLOT).join(SIGNAL_UNLOCKED_FILE),
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
             "ok",
         )
         .expect("write app unlocked");
         fs::write(
-            signal_dir.path.join(SIGNAL_TLS_DATA_SLOT).join(SIGNAL_UNLOCKED_FILE),
+            signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
             "ok",
         )
         .expect("write tls unlocked");
@@ -931,7 +942,8 @@ mod tests {
     #[test]
     fn derive_luks_key_zeroizes_source_password_buffer() {
         let signal_dir = test_signal_dir("kdf-source-zeroize");
-        let guard = OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
+        let guard =
+            OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
 
         let mut password = Zeroizing::new(b"password123".to_vec());
 
@@ -949,10 +961,13 @@ mod tests {
     #[test]
     fn handoff_poll_paths() {
         let signal_dir = test_signal_dir("handoff");
-        let guard = OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
+        let guard =
+            OwnershipGuard::new_with_signal_dir("level1".to_string(), signal_dir.path.clone());
 
         let key = [0xAB; 32];
-        guard.write_handoff_key(&key).expect("key write should succeed");
+        guard
+            .write_handoff_key(&key)
+            .expect("key write should succeed");
 
         let key_path = signal_dir.path.join(SIGNAL_KEY_FILE);
         assert_eq!(fs::read(&key_path).expect("read key file"), key.to_vec());
@@ -963,15 +978,19 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
 
-        fs::write(signal_dir.path.join(SIGNAL_UNLOCKED_FILE), "unlocked_at=now")
-            .expect("write unlocked");
+        fs::write(
+            signal_dir.path.join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write unlocked");
         assert_eq!(
             guard.poll_handoff_result(1).expect("unlocked result"),
             HandoffOutcome::Unlocked
         );
 
         fs::remove_file(signal_dir.path.join(SIGNAL_UNLOCKED_FILE)).expect("remove unlocked");
-        fs::write(signal_dir.path.join(SIGNAL_ERROR_FILE), "wrong_password\n").expect("write error");
+        fs::write(signal_dir.path.join(SIGNAL_ERROR_FILE), "wrong_password\n")
+            .expect("write error");
         assert_eq!(
             guard.poll_handoff_result(1).expect("wrong_password result"),
             HandoffOutcome::WrongPassword

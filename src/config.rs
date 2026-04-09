@@ -139,8 +139,14 @@ impl Config {
             tenant_instance_identity_hash: env_or("TENANT_INSTANCE_IDENTITY_HASH", ""),
             ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
-            k8s_ca_cert_path: env_or("K8S_CA_CERT_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
-            k8s_service_account_token_path: env_or("K8S_SERVICE_ACCOUNT_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            k8s_ca_cert_path: env_or(
+                "K8S_CA_CERT_PATH",
+                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+            ),
+            k8s_service_account_token_path: env_or(
+                "K8S_SERVICE_ACCOUNT_TOKEN_PATH",
+                "/var/run/secrets/kubernetes.io/serviceaccount/token",
+            ),
             owner_escrow_secret_name: env_or("OWNER_ESCROW_SECRET_NAME", ""),
             owner_escrow_encrypted_key: env_or("OWNER_ESCROW_ENCRYPTED_KEY", "seed-encrypted"),
             owner_escrow_sealed_key: env_or("OWNER_ESCROW_SEALED_KEY", "seed-sealed"),
@@ -164,7 +170,9 @@ impl Config {
             aa_token_refresh_skew_seconds: 5.0,
             aa_token_fetch_attempts: 3,
             aa_token_fetch_retry_sleep_seconds: 1.0,
-            kbs_resource_url: "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource".into(),
+            kbs_resource_url:
+                "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
+                    .into(),
             kbs_resource_cache_seconds: 300.0,
             kbs_resource_failure_cache_seconds: 30.0,
             attestation_profile: "coco-sev-snp".into(),
@@ -190,7 +198,8 @@ impl Config {
             ownership_challenge_ttl_seconds: 300.0,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
-            k8s_service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token".into(),
+            k8s_service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                .into(),
             owner_escrow_secret_name: "".into(),
             owner_escrow_encrypted_key: "seed-encrypted".into(),
             owner_escrow_sealed_key: "seed-sealed".into(),
@@ -255,10 +264,7 @@ mod tests {
 
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 8081);
-        assert_eq!(
-            config.aa_evidence_url,
-            "http://127.0.0.1:8006/aa/evidence"
-        );
+        assert_eq!(config.aa_evidence_url, "http://127.0.0.1:8006/aa/evidence");
         assert_eq!(
             config.aa_token_url,
             "http://127.0.0.1:8006/aa/token?token_type=kbs"

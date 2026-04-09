@@ -1,3 +1,8 @@
+use attestation_proxy::attestation::AaTokenCache;
+use attestation_proxy::config::Config;
+use attestation_proxy::handlers;
+use attestation_proxy::ownership::OwnershipGuard;
+use attestation_proxy::AppState;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request};
@@ -5,21 +10,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use attestation_proxy::attestation::AaTokenCache;
-use attestation_proxy::config::Config;
-use attestation_proxy::handlers;
-use attestation_proxy::ownership::OwnershipGuard;
-use attestation_proxy::AppState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 /// Ownership gate middleware: blocks non-allowed paths with 423 in level1 mode.
-async fn ownership_gate(
-    State(state): State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
     if state.ownership.should_gate(&path) {
         let body = serde_json::json!({
@@ -62,7 +58,10 @@ async fn main() {
         .route("/.well-known/confidential/status", get(handlers::status))
         .route("/v1/attestation/info", get(handlers::attestation_info))
         .route("/v1/attestation", get(handlers::attestation))
-        .route("/.well-known/confidential/attestation", get(handlers::attestation))
+        .route(
+            "/.well-known/confidential/attestation",
+            get(handlers::attestation),
+        )
         .route("/cdh/resource/{*path}", get(handlers::cdh_resource))
         .route("/unlock", post(handlers::unlock))
         .route("/.well-known/confidential/unlock", post(handlers::unlock))
@@ -92,7 +91,10 @@ async fn main() {
             post(handlers::bootstrap_claim),
         )
         .fallback(handlers::not_found)
-        .layer(middleware::from_fn_with_state(state.clone(), ownership_gate))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ownership_gate,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
