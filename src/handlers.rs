@@ -269,7 +269,9 @@ fn bootstrap_pubkey_hash_matches(expected: &str, raw_pubkey: &[u8]) -> bool {
 fn is_missing_owner_seed_resource(error_json: &Value) -> bool {
     matches!(
         error_json.get("upstream_status").and_then(Value::as_u64),
-        Some(404)
+        // AA/CDH currently surfaces a missing owner-seed resource as 500 even
+        // though the underlying KBS read is a 404.
+        Some(404) | Some(500)
     )
 }
 
@@ -1579,12 +1581,15 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     #[test]
-    fn missing_owner_seed_resource_only_accepts_404() {
+    fn missing_owner_seed_resource_accepts_404_and_500() {
         assert!(is_missing_owner_seed_resource(
             &json!({"upstream_status": 404})
         ));
-        assert!(!is_missing_owner_seed_resource(
+        assert!(is_missing_owner_seed_resource(
             &json!({"upstream_status": 500})
+        ));
+        assert!(!is_missing_owner_seed_resource(
+            &json!({"upstream_status": 401})
         ));
     }
 
