@@ -957,6 +957,54 @@ mod tests {
     }
 
     #[test]
+    fn health_and_gate_contract_for_manual_unlock_states() {
+        let signal_dir = test_signal_dir("state-contract");
+        let guard =
+            OwnershipGuard::new_with_signal_dir("password".to_string(), signal_dir.path.clone());
+        let gated_path = "/cdh/resource/default/instance-test-01-owner/seed-encrypted";
+
+        guard.set_unclaimed();
+        let (status, body) = guard.health_status();
+        assert_eq!(status, 200);
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("unclaimed"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unclaimed"));
+        assert_eq!(
+            body.get("auto_unlock_enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(!guard.should_gate("/unlock"));
+        assert!(guard.should_gate(gated_path));
+
+        guard.set_locked();
+        let (status, body) = guard.health_status();
+        assert_eq!(status, 423);
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("locked"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("locked"));
+        assert!(guard.should_gate(gated_path));
+
+        guard.set_unlocking();
+        let (status, body) = guard.health_status();
+        assert_eq!(status, 423);
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("locked"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocking"));
+        assert!(guard.should_gate(gated_path));
+
+        guard.set_unlocked();
+        let (status, body) = guard.health_status();
+        assert_eq!(status, 200);
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
+        assert!(!guard.should_gate(gated_path));
+
+        guard.set_error("handoff_failed");
+        let (status, body) = guard.health_status();
+        assert_eq!(status, 423);
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("locked"));
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("error"));
+        assert!(guard.should_gate(gated_path));
+    }
+
+    #[test]
     fn kdf_parity_and_zeroize() {
         let signal_dir = test_signal_dir("kdf");
         let guard =

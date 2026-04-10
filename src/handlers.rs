@@ -1895,7 +1895,7 @@ mod tests {
     };
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -2002,6 +2002,106 @@ mod tests {
                 .and_then(Value::as_str),
             Some("unclaimed")
         );
+    }
+
+    #[tokio::test]
+    async fn status_returns_documented_contract_fields() {
+        let signal_dir = test_signal_dir("status-contract");
+        let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("status-contract-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+        let expected_ciphertext_backend = state.config.owner_ciphertext_backend.clone();
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let keys: BTreeSet<_> = body
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .cloned()
+            .collect();
+        let expected_keys: BTreeSet<_> = [
+            "state",
+            "mode",
+            "error",
+            "auto_unlock_enabled",
+            "instance_id",
+            "ciphertext_backend",
+            "tenant_id",
+            "claims_instance_id",
+            "bootstrap_owner_pubkey_hash",
+            "tenant_instance_identity_hash",
+            "claims_verified",
+            "claims_error",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(keys, expected_keys);
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unclaimed"));
+        assert_eq!(body.get("mode").and_then(Value::as_str), Some("password"));
+        assert!(body.get("error").is_some_and(Value::is_null));
+        assert_eq!(
+            body.get("auto_unlock_enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("instance_id").and_then(Value::as_str),
+            Some("instance-test-01")
+        );
+        assert_eq!(
+            body.get("ciphertext_backend").and_then(Value::as_str),
+            Some(expected_ciphertext_backend.as_str())
+        );
+        assert_eq!(body.get("tenant_id").and_then(Value::as_str), Some("tenant-test"));
+        assert_eq!(
+            body.get("claims_instance_id").and_then(Value::as_str),
+            Some("instance-test-01")
+        );
+        assert_eq!(
+            body.get("bootstrap_owner_pubkey_hash")
+                .and_then(Value::as_str),
+            Some(bootstrap_hash.as_str())
+        );
+        assert_eq!(
+            body.get("tenant_instance_identity_hash")
+                .and_then(Value::as_str),
+            Some("test-tenant-instance-hash")
+        );
+        assert_eq!(
+            body.get("claims_verified").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(body.get("claims_error").is_some_and(Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn status_returns_not_found_for_legacy_mode() {
+        let signal_dir = test_signal_dir("status-legacy-mode");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "legacy",
+            "http://127.0.0.1:8080".to_string(),
+            None,
+        );
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 404);
+        assert_eq!(read_json(response).await, json!({"error": "not_found"}));
     }
 
     #[tokio::test]
