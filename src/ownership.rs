@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 pub const UNLOCK_MAX_ATTEMPTS: usize = 5;
 pub const UNLOCK_WINDOW_SECONDS: u64 = 60;
+pub const BOOTSTRAP_CHALLENGE_MAX_ACTIVE: usize = 32;
 pub const SIGNAL_KEY_FILE: &str = "key";
 pub const SIGNAL_UNLOCKED_FILE: &str = "unlocked";
 pub const SIGNAL_ERROR_FILE: &str = "error";
@@ -210,6 +211,35 @@ pub struct OwnershipGuard {
 }
 
 impl OwnershipGuard {
+    fn prune_expired_attempts(machine: &mut OwnershipMachine, now: Instant) {
+        let window = Duration::from_secs(UNLOCK_WINDOW_SECONDS);
+        while let Some(front) = machine.attempts.front() {
+            if now.duration_since(*front) >= window {
+                machine.attempts.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn begin_secret_operation_attempt(&self) -> Result<(), OwnershipError> {
+        if !self.mode.requires_manual_unlock() {
+            return Ok(());
+        }
+
+        let mut machine = self.machine.lock().expect("ownership lock poisoned");
+        let now = Self::now();
+        Self::prune_expired_attempts(&mut machine, now);
+
+        if machine.attempts.len() >= UNLOCK_MAX_ATTEMPTS {
+            return Err(OwnershipError::RateLimited);
+        }
+
+        machine.attempts.push_back(now);
+        machine.error = None;
+        Ok(())
+    }
+
     pub fn new(mode: String) -> Self {
         Self::new_with_signal_dir(mode, PathBuf::from("/run/ownership-signal"))
     }
@@ -239,15 +269,8 @@ impl OwnershipGuard {
         }
 
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
-        let window = Duration::from_secs(UNLOCK_WINDOW_SECONDS);
         let now = Self::now();
-        while let Some(front) = machine.attempts.front() {
-            if now.duration_since(*front) >= window {
-                machine.attempts.pop_front();
-            } else {
-                break;
-            }
-        }
+        Self::prune_expired_attempts(&mut machine, now);
 
         if machine.attempts.len() >= UNLOCK_MAX_ATTEMPTS {
             return Err(OwnershipError::RateLimited);

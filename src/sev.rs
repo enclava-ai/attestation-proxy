@@ -50,9 +50,14 @@ fn ioctl_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn log_sev_internal_error(code: &str, detail: impl std::fmt::Display) -> String {
+    eprintln!("{code}:{detail}");
+    code.to_string()
+}
+
 fn parse_proc_misc_minor(name: &str) -> Result<Option<u32>, String> {
-    let contents =
-        fs::read_to_string("/proc/misc").map_err(|err| format!("proc_misc_read_failed:{err}"))?;
+    let contents = fs::read_to_string("/proc/misc")
+        .map_err(|err| log_sev_internal_error("proc_misc_read_failed", err))?;
     for line in contents.lines() {
         let mut parts = line.split_whitespace();
         let minor = parts.next();
@@ -61,7 +66,7 @@ fn parse_proc_misc_minor(name: &str) -> Result<Option<u32>, String> {
             let parsed = minor
                 .ok_or_else(|| "proc_misc_minor_missing".to_string())?
                 .parse::<u32>()
-                .map_err(|err| format!("proc_misc_minor_parse_failed:{err}"))?;
+                .map_err(|err| log_sev_internal_error("proc_misc_minor_parse_failed", err))?;
             return Ok(Some(parsed));
         }
     }
@@ -70,7 +75,8 @@ fn parse_proc_misc_minor(name: &str) -> Result<Option<u32>, String> {
 
 fn ensure_sev_guest_device(path: &Path) -> Result<(), String> {
     if path.exists() {
-        let metadata = fs::metadata(path).map_err(|err| format!("sev_guest_stat_failed:{err}"))?;
+        let metadata = fs::metadata(path)
+            .map_err(|err| log_sev_internal_error("sev_guest_stat_failed", err))?;
         if !metadata.file_type().is_char_device() {
             return Err("sev_guest_not_char_device".to_string());
         }
@@ -89,7 +95,7 @@ fn ensure_sev_guest_device(path: &Path) -> Result<(), String> {
         if err.kind() == io::ErrorKind::AlreadyExists {
             return Ok(());
         }
-        return Err(format!("sev_guest_mknod_failed:{err}"));
+        return Err(log_sev_internal_error("sev_guest_mknod_failed", err));
     }
     Ok(())
 }
@@ -114,7 +120,7 @@ pub fn derive_measurement_policy_key() -> Result<Zeroizing<[u8; 32]>, String> {
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|err| format!("sev_guest_open_failed:{err}"))?;
+        .map_err(|err| log_sev_internal_error("sev_guest_open_failed", err))?;
 
     let mut req = SnpDerivedKeyReq {
         // Use the VCEK root and bind the derived bytes to guest policy + measurement.
@@ -136,18 +142,17 @@ pub fn derive_measurement_policy_key() -> Result<Zeroizing<[u8; 32]>, String> {
 
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), SNP_GET_DERIVED_KEY as _, &mut guest_req) };
     if rc != 0 {
-        return Err(format!(
-            "sev_guest_ioctl_failed:{}",
-            io::Error::last_os_error()
+        return Err(log_sev_internal_error(
+            "sev_guest_ioctl_failed",
+            io::Error::last_os_error(),
         ));
     }
 
     let fw_error = extract_fw_error(guest_req.exitinfo2);
     let vmm_error = extract_vmm_error(guest_req.exitinfo2);
     if fw_error != 0 || vmm_error != 0 {
-        return Err(format!(
-            "sev_guest_derived_key_error:fw={fw_error}:vmm={vmm_error}"
-        ));
+        eprintln!("sev_guest_derived_key_error:fw={fw_error}:vmm={vmm_error}");
+        return Err("sev_guest_derived_key_error".to_string());
     }
 
     let mut derived = Zeroizing::new([0u8; 32]);

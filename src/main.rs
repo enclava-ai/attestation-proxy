@@ -10,7 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
@@ -46,7 +46,7 @@ async fn main() {
         http_client: reqwest::Client::new(),
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
-        bootstrap_challenge: Arc::new(Mutex::new(None)),
+        bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
     };
 
     handlers::initialize_ownership_state(&state).await;

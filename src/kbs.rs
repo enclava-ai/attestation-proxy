@@ -515,7 +515,9 @@ mod tests {
                 "level1".to_string(),
                 signal_dir.clone(),
             )),
-            bootstrap_challenge: Arc::new(std::sync::Mutex::new(None)),
+            bootstrap_challenges: Arc::new(
+                std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ),
         };
 
         // Verify entry exists before eviction

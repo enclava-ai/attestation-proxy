@@ -19,7 +19,7 @@ percent-encoding = "2"
 argon2 = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
 thiserror = "2"
 aes-gcm = "0.10"
 rand = "0.8"

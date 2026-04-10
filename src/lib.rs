@@ -6,7 +6,7 @@ pub mod kbs;
 pub mod ownership;
 pub mod sev;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
@@ -23,5 +23,5 @@ pub struct AppState {
     pub aa_token_cache: Arc<RwLock<AaTokenCache>>,
     pub kbs_resource_cache: Arc<RwLock<HashMap<String, KbsCacheEntry>>>,
     pub ownership: Arc<OwnershipGuard>,
-    pub bootstrap_challenge: Arc<Mutex<Option<BootstrapChallenge>>>,
+    pub bootstrap_challenges: Arc<Mutex<VecDeque<BootstrapChallenge>>>,
 }

@@ -22,7 +22,8 @@ use crate::escrow::{self, EscrowValueUpdate, OwnerSeedMaterial};
 use crate::kbs;
 use crate::ownership::utc_now;
 use crate::ownership::{
-    BootstrapChallenge, HandoffOutcome, OwnershipError, SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
+    BootstrapChallenge, HandoffOutcome, OwnershipError, BOOTSTRAP_CHALLENGE_MAX_ACTIVE,
+    SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
 };
 use crate::AppState;
 
@@ -38,19 +39,19 @@ pub struct AttestationQuery {
 
 #[derive(serde::Deserialize)]
 pub struct UnlockRequest {
-    pub password: String,
+    pub password: Zeroizing<String>,
 }
 
 #[derive(serde::Deserialize)]
 pub struct ChangePasswordRequest {
-    pub old_password: String,
-    pub new_password: String,
+    pub old_password: Zeroizing<String>,
+    pub new_password: Zeroizing<String>,
 }
 
 #[derive(serde::Deserialize)]
 pub struct RecoverRequest {
-    pub mnemonic: String,
-    pub new_password: String,
+    pub mnemonic: Zeroizing<String>,
+    pub new_password: Zeroizing<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -58,7 +59,67 @@ pub struct BootstrapClaimRequest {
     pub challenge: String,
     pub bootstrap_pubkey: String,
     pub signature: String,
-    pub password: String,
+    pub password: Zeroizing<String>,
+}
+
+fn take_secret_bytes(secret: &mut Zeroizing<String>) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(std::mem::take(&mut **secret).into_bytes())
+}
+
+fn rate_limited_response() -> Response {
+    json_response(429, &json!({"error": "rate_limited", "retry_after": 60}))
+}
+
+fn begin_rate_limited_secret_operation(state: &AppState) -> Option<Response> {
+    match state.ownership.begin_secret_operation_attempt() {
+        Ok(()) => None,
+        Err(OwnershipError::RateLimited) => Some(rate_limited_response()),
+        Err(err) => Some(json_response(
+            500,
+            &json!({"error": "operation_failed", "detail": err.to_string()}),
+        )),
+    }
+}
+
+fn prune_bootstrap_challenges(
+    challenges: &mut std::collections::VecDeque<BootstrapChallenge>,
+    now: Instant,
+) {
+    while matches!(challenges.front(), Some(challenge) if now >= challenge.expires_at) {
+        challenges.pop_front();
+    }
+}
+
+fn record_bootstrap_challenge(state: &AppState, challenge_b64: String, expires_at: Instant) {
+    let mut challenges = state
+        .bootstrap_challenges
+        .lock()
+        .expect("bootstrap challenge lock poisoned");
+    prune_bootstrap_challenges(&mut challenges, Instant::now());
+    if challenges.len() >= BOOTSTRAP_CHALLENGE_MAX_ACTIVE {
+        challenges.pop_front();
+    }
+    challenges.push_back(BootstrapChallenge {
+        challenge_b64,
+        expires_at,
+    });
+}
+
+fn consume_bootstrap_challenge(state: &AppState, challenge_b64: &str) -> bool {
+    let mut challenges = state
+        .bootstrap_challenges
+        .lock()
+        .expect("bootstrap challenge lock poisoned");
+    let now = Instant::now();
+    prune_bootstrap_challenges(&mut challenges, now);
+    let Some(index) = challenges
+        .iter()
+        .position(|challenge| challenge.challenge_b64 == challenge_b64)
+    else {
+        return false;
+    };
+    challenges.remove(index);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -973,8 +1034,11 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
 }
 
 /// POST /unlock, POST /.well-known/confidential/unlock.
-pub async fn unlock(State(state): State<AppState>, Json(payload): Json<UnlockRequest>) -> Response {
-    let mut password = Zeroizing::new(payload.password.into_bytes());
+pub async fn unlock(
+    State(state): State<AppState>,
+    Json(mut payload): Json<UnlockRequest>,
+) -> Response {
+    let mut password = take_secret_bytes(&mut payload.password);
 
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
@@ -990,9 +1054,7 @@ pub async fn unlock(State(state): State<AppState>, Json(payload): Json<UnlockReq
 
     if let Err(err) = state.ownership.begin_unlock_attempt() {
         return match err {
-            OwnershipError::RateLimited => {
-                json_response(429, &json!({"error": "rate_limited", "retry_after": 60}))
-            }
+            OwnershipError::RateLimited => rate_limited_response(),
             OwnershipError::NotLocked => {
                 let current_state = state
                     .ownership
@@ -1288,16 +1350,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
     let expires_at = Instant::now()
         + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds as u64);
-    {
-        let mut slot = state
-            .bootstrap_challenge
-            .lock()
-            .expect("bootstrap challenge lock poisoned");
-        *slot = Some(BootstrapChallenge {
-            challenge_b64: challenge_b64.clone(),
-            expires_at,
-        });
-    }
+    record_bootstrap_challenge(&state, challenge_b64.clone(), expires_at);
 
     json_response(
         200,
@@ -1312,7 +1365,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
 
 pub async fn bootstrap_claim(
     State(state): State<AppState>,
-    Json(payload): Json<BootstrapClaimRequest>,
+    Json(mut payload): Json<BootstrapClaimRequest>,
 ) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
@@ -1328,21 +1381,7 @@ pub async fn bootstrap_claim(
         return json_response(400, &json!({"error": "password_required"}));
     }
 
-    let challenge_ok = {
-        let slot = state
-            .bootstrap_challenge
-            .lock()
-            .expect("bootstrap challenge lock poisoned");
-        match slot.as_ref() {
-            Some(challenge)
-                if challenge.challenge_b64 == payload.challenge
-                    && Instant::now() < challenge.expires_at =>
-            {
-                true
-            }
-            _ => false,
-        }
-    };
+    let challenge_ok = consume_bootstrap_challenge(&state, &payload.challenge);
     if !challenge_ok {
         return json_response(400, &json!({"error": "bootstrap_challenge_invalid"}));
     }
@@ -1370,7 +1409,7 @@ pub async fn bootstrap_claim(
         );
     }
 
-    let mut password = Zeroizing::new(payload.password.into_bytes());
+    let mut password = take_secret_bytes(&mut payload.password);
     let wrap_key = match state
         .ownership
         .derive_password_wrap_key(&mut password, &state.config.instance_id)
@@ -1432,13 +1471,6 @@ pub async fn bootstrap_claim(
                     "warning": warning.clone(),
                 }),
             );
-            {
-                let mut slot = state
-                    .bootstrap_challenge
-                    .lock()
-                    .expect("bootstrap challenge lock poisoned");
-                *slot = None;
-            }
             json_response(
                 200,
                 &json!({
@@ -1462,12 +1494,15 @@ pub async fn bootstrap_claim(
 
 pub async fn change_password(
     State(state): State<AppState>,
-    Json(payload): Json<ChangePasswordRequest>,
+    Json(mut payload): Json<ChangePasswordRequest>,
 ) -> Response {
-    let mut old_password = Zeroizing::new(payload.old_password.into_bytes());
-    let mut new_password = Zeroizing::new(payload.new_password.into_bytes());
+    let mut old_password = take_secret_bytes(&mut payload.old_password);
+    let mut new_password = take_secret_bytes(&mut payload.new_password);
     if old_password.is_empty() || new_password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
+    }
+    if let Some(response) = begin_rate_limited_secret_operation(&state) {
+        return response;
     }
 
     let material = match load_owner_seed_material_with_revalidation(&state).await {
@@ -1563,13 +1598,19 @@ pub async fn change_password(
 
 pub async fn recover(
     State(state): State<AppState>,
-    Json(payload): Json<RecoverRequest>,
+    Json(mut payload): Json<RecoverRequest>,
 ) -> Response {
     if payload.new_password.trim().is_empty() || payload.mnemonic.trim().is_empty() {
         return json_response(400, &json!({"error": "mnemonic_and_password_required"}));
     }
+    if let Some(response) = begin_rate_limited_secret_operation(&state) {
+        return response;
+    }
 
-    let owner_seed = match state.ownership.owner_seed_from_mnemonic(&payload.mnemonic) {
+    let owner_seed = match state
+        .ownership
+        .owner_seed_from_mnemonic(payload.mnemonic.as_str())
+    {
         Ok(seed) => seed,
         Err(err) => {
             return json_response(
@@ -1578,7 +1619,7 @@ pub async fn recover(
             )
         }
     };
-    let mut new_password = Zeroizing::new(payload.new_password.into_bytes());
+    let mut new_password = take_secret_bytes(&mut payload.new_password);
     let wrap_key = match state
         .ownership
         .derive_password_wrap_key(&mut new_password, &state.config.instance_id)
@@ -1646,11 +1687,14 @@ pub async fn recover(
 
 pub async fn enable_auto_unlock(
     State(state): State<AppState>,
-    Json(payload): Json<UnlockRequest>,
+    Json(mut payload): Json<UnlockRequest>,
 ) -> Response {
-    let mut password = Zeroizing::new(payload.password.into_bytes());
+    let mut password = take_secret_bytes(&mut payload.password);
     if password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
+    }
+    if let Some(response) = begin_rate_limited_secret_operation(&state) {
+        return response;
     }
     let material = match load_owner_seed_material_with_revalidation(&state).await {
         Ok(material) if material.encrypted.is_some() => material,
@@ -1740,11 +1784,14 @@ pub async fn enable_auto_unlock(
 
 pub async fn disable_auto_unlock(
     State(state): State<AppState>,
-    Json(payload): Json<UnlockRequest>,
+    Json(mut payload): Json<UnlockRequest>,
 ) -> Response {
-    let mut password = Zeroizing::new(payload.password.into_bytes());
+    let mut password = take_secret_bytes(&mut payload.password);
     if password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
+    }
+    if let Some(response) = begin_rate_limited_secret_operation(&state) {
+        return response;
     }
     let material = match load_owner_seed_material_with_revalidation(&state).await {
         Ok(material) if material.encrypted.is_some() => material,
@@ -1970,7 +2017,7 @@ mod tests {
         let response = unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "correct-password".to_string(),
+                password: Zeroizing::new("correct-password".to_string()),
             }),
         )
         .await;
@@ -2000,7 +2047,7 @@ mod tests {
         let wrong_password = unlock(
             State(wrong_state.clone()),
             Json(UnlockRequest {
-                password: "bad-password".to_string(),
+                password: Zeroizing::new("bad-password".to_string()),
             }),
         )
         .await;
@@ -2030,7 +2077,7 @@ mod tests {
         let fatal = unlock(
             State(fatal_state.clone()),
             Json(UnlockRequest {
-                password: "password".to_string(),
+                password: Zeroizing::new("password".to_string()),
             }),
         )
         .await;
@@ -2053,7 +2100,7 @@ mod tests {
         let timeout = unlock(
             State(timeout_state.clone()),
             Json(UnlockRequest {
-                password: "password".to_string(),
+                password: Zeroizing::new("password".to_string()),
             }),
         )
         .await;
@@ -2082,7 +2129,7 @@ mod tests {
             let retry = unlock(
                 State(rate_state.clone()),
                 Json(UnlockRequest {
-                    password: "password".to_string(),
+                    password: Zeroizing::new("password".to_string()),
                 }),
             )
             .await;
@@ -2096,7 +2143,7 @@ mod tests {
         let rate_limited = unlock(
             State(rate_state),
             Json(UnlockRequest {
-                password: "password".to_string(),
+                password: Zeroizing::new("password".to_string()),
             }),
         )
         .await;
@@ -2142,7 +2189,7 @@ mod tests {
         let response = unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "correct-password".to_string(),
+                password: Zeroizing::new("correct-password".to_string()),
             }),
         )
         .await;
@@ -2183,7 +2230,7 @@ mod tests {
         let response = unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "bad-password".to_string(),
+                password: Zeroizing::new("bad-password".to_string()),
             }),
         )
         .await;
@@ -2238,7 +2285,7 @@ mod tests {
         let response = unlock(
             State(state),
             Json(UnlockRequest {
-                password: "correct-password".to_string(),
+                password: Zeroizing::new("correct-password".to_string()),
             }),
         )
         .await;
@@ -2316,6 +2363,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_claim_accepts_first_of_multiple_active_challenges() {
+        let signal_dir = test_signal_dir("bootstrap-claim-multi-slot");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[12u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("bootstrap-claim-multi-slot-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let challenge1 = read_json(bootstrap_challenge(State(state.clone())).await).await;
+        let challenge2 = read_json(bootstrap_challenge(State(state.clone())).await).await;
+        let challenge1_b64 = challenge1
+            .get("challenge")
+            .and_then(Value::as_str)
+            .expect("challenge 1");
+        let challenge2_b64 = challenge2
+            .get("challenge")
+            .and_then(Value::as_str)
+            .expect("challenge 2");
+        assert_ne!(challenge1_b64, challenge2_b64);
+
+        let signature = signing_key.sign(
+            &BASE64_URL_SAFE_NO_PAD
+                .decode(challenge1_b64.as_bytes())
+                .expect("decode challenge 1"),
+        );
+        let response = bootstrap_claim(
+            State(state.clone()),
+            Json(BootstrapClaimRequest {
+                challenge: challenge1_b64.to_string(),
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("CLAIM_ACCEPTED")
+        );
+    }
+
+    #[tokio::test]
     async fn change_password_rewraps_seed_without_rotating_owner_identity() {
         let signal_dir = test_signal_dir("change-password");
         mark_password_slots_unlocked(&signal_dir.path);
@@ -2347,8 +2451,8 @@ mod tests {
         let response = change_password(
             State(state.clone()),
             Json(ChangePasswordRequest {
-                old_password: "old-password".to_string(),
-                new_password: "new-password".to_string(),
+                old_password: Zeroizing::new("old-password".to_string()),
+                new_password: Zeroizing::new("new-password".to_string()),
             }),
         )
         .await;
@@ -2371,6 +2475,61 @@ mod tests {
         assert_eq!(
             decrypt_owner_seed_result(&state, &encrypted, "old-password"),
             Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn change_password_is_rate_limited_after_repeated_wrong_passwords() {
+        let signal_dir = test_signal_dir("change-password-rate-limit");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("change-password-rate-limit-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "old-password").await;
+
+        for _ in 0..5 {
+            let response = change_password(
+                State(state.clone()),
+                Json(ChangePasswordRequest {
+                    old_password: Zeroizing::new("wrong-password".to_string()),
+                    new_password: Zeroizing::new("new-password".to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 401);
+            assert_eq!(
+                read_json(response).await,
+                json!({"error": "wrong_password"})
+            );
+        }
+
+        let limited = change_password(
+            State(state),
+            Json(ChangePasswordRequest {
+                old_password: Zeroizing::new("wrong-password".to_string()),
+                new_password: Zeroizing::new("new-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(limited.status().as_u16(), 429);
+        assert_eq!(
+            read_json(limited).await,
+            json!({"error": "rate_limited", "retry_after": 60})
         );
     }
 
@@ -2414,8 +2573,8 @@ mod tests {
         let response = recover(
             State(state.clone()),
             Json(RecoverRequest {
-                mnemonic,
-                new_password: "recovered-password".to_string(),
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
             }),
         )
         .await;
@@ -2444,6 +2603,64 @@ mod tests {
         assert_eq!(
             decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
             Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_is_rate_limited_after_repeated_invalid_mnemonics() {
+        let signal_dir = test_signal_dir("recover-rate-limit");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[14u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-rate-limit-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "initial-password").await;
+
+        for _ in 0..5 {
+            let response = recover(
+                State(state.clone()),
+                Json(RecoverRequest {
+                    mnemonic: Zeroizing::new("not a valid mnemonic".to_string()),
+                    new_password: Zeroizing::new("recovered-password".to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 400);
+            assert_eq!(
+                read_json(response)
+                    .await
+                    .get("error")
+                    .and_then(Value::as_str),
+                Some("mnemonic_invalid")
+            );
+        }
+
+        let limited = recover(
+            State(state),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new("not a valid mnemonic".to_string()),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(limited.status().as_u16(), 429);
+        assert_eq!(
+            read_json(limited).await,
+            json!({"error": "rate_limited", "retry_after": 60})
         );
     }
 
@@ -2481,7 +2698,7 @@ mod tests {
         let enable = enable_auto_unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "initial-password".to_string(),
+                password: Zeroizing::new("initial-password".to_string()),
             }),
         )
         .await;
@@ -2496,8 +2713,8 @@ mod tests {
         let response = recover(
             State(state.clone()),
             Json(RecoverRequest {
-                mnemonic,
-                new_password: "recovered-password".to_string(),
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
             }),
         )
         .await;
@@ -2567,7 +2784,7 @@ mod tests {
         let enable = enable_auto_unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "claim-password".to_string(),
+                password: Zeroizing::new("claim-password".to_string()),
             }),
         )
         .await;
@@ -2606,7 +2823,7 @@ mod tests {
         let disable = disable_auto_unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: "claim-password".to_string(),
+                password: Zeroizing::new("claim-password".to_string()),
             }),
         )
         .await;
@@ -2724,7 +2941,7 @@ mod tests {
                 mode.to_string(),
                 signal_dir.clone(),
             )),
-            bootstrap_challenge: Arc::new(Mutex::new(None)),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -2760,7 +2977,7 @@ mod tests {
                 mode.to_string(),
                 signal_dir.clone(),
             )),
-            bootstrap_challenge: Arc::new(Mutex::new(None)),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -3218,7 +3435,7 @@ mod tests {
                 bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
                     .encode(signing_key.verifying_key().as_bytes()),
                 signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-                password: password.to_string(),
+                password: Zeroizing::new(password.to_string()),
             }),
         )
         .await;
