@@ -1,9 +1,10 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bip39::{Language, Mnemonic};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -11,8 +12,11 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::io::Write;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -36,6 +40,48 @@ pub const OWNER_SEED_SEAL_INFO: &[u8] = b"enclava-owner-seed-seal-v1";
 pub const OWNER_LUKS_APP_DATA_INFO: &[u8] = b"enclava-luks-app-data-v1";
 pub const OWNER_LUKS_TLS_DATA_INFO: &[u8] = b"enclava-luks-tls-data-v1";
 pub const OWNER_ED25519_SEED_INFO: &[u8] = b"enclava-owner-ed25519-seed-v1";
+pub const OWNER_AUDIT_EVENT_VERSION: &str = "enclava-owner-audit-v1";
+
+/// Best-effort zeroizing wrapper for fixed-size crypto state from crates that
+/// do not implement `Zeroize` or `Drop`. Only use this for stack-only types
+/// with no heap allocations or custom destructors.
+struct SensitiveState<T> {
+    inner: ManuallyDrop<T>,
+}
+
+impl<T> SensitiveState<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner: ManuallyDrop::new(inner),
+        }
+    }
+}
+
+impl<T> Deref for SensitiveState<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*((&self.inner as *const ManuallyDrop<T>).cast::<T>()) }
+    }
+}
+
+impl<T> DerefMut for SensitiveState<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *((&mut self.inner as *mut ManuallyDrop<T>).cast::<T>()) }
+    }
+}
+
+impl<T> Drop for SensitiveState<T> {
+    fn drop(&mut self) {
+        unsafe {
+            ptr::write_bytes(
+                (&mut self.inner as *mut ManuallyDrop<T>).cast::<u8>(),
+                0,
+                std::mem::size_of::<T>(),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnershipMode {
@@ -270,7 +316,7 @@ impl OwnershipGuard {
         &self,
         password: &mut Zeroizing<Vec<u8>>,
         instance_id: &str,
-    ) -> Result<[u8; 32], OwnershipError> {
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         self.derive_hkdf_key(password, instance_id, b"enclava-storage-v1")
     }
 
@@ -278,7 +324,7 @@ impl OwnershipGuard {
         &self,
         password: &mut Zeroizing<Vec<u8>>,
         instance_id: &str,
-    ) -> Result<[u8; 32], OwnershipError> {
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         self.derive_hkdf_key(password, instance_id, OWNER_SEED_WRAP_INFO)
     }
 
@@ -287,7 +333,7 @@ impl OwnershipGuard {
         password: &mut Zeroizing<Vec<u8>>,
         instance_id: &str,
         info: &[u8],
-    ) -> Result<[u8; 32], OwnershipError> {
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         if password.is_empty() {
             password.zeroize();
             return Err(OwnershipError::PasswordRequired);
@@ -312,9 +358,12 @@ impl OwnershipGuard {
                 )
                 .map_err(|err| OwnershipError::Kdf(err.to_string()))?;
 
-            let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), stretched.as_slice());
-            let mut derived = [0u8; 32];
-            if let Err(err) = hkdf.expand(info, &mut derived) {
+            let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(
+                Some(salt.as_slice()),
+                stretched.as_slice(),
+            ));
+            let mut derived = Zeroizing::new([0u8; 32]);
+            if let Err(err) = hkdf.expand(info, &mut derived[..]) {
                 derived.zeroize();
                 return Err(OwnershipError::Kdf(err.to_string()));
             }
@@ -330,7 +379,7 @@ impl OwnershipGuard {
         &self,
         envelope_bytes: &[u8],
         wrap_key: &[u8; 32],
-    ) -> Result<[u8; 32], OwnershipError> {
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         let envelope: OwnerSeedEnvelope = serde_json::from_slice(envelope_bytes)
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
         if envelope.version != OWNER_SEED_ENVELOPE_VERSION {
@@ -368,7 +417,7 @@ impl OwnershipGuard {
             )));
         }
 
-        let mut owner_seed = [0u8; 32];
+        let mut owner_seed = Zeroizing::new([0u8; 32]);
         owner_seed.copy_from_slice(plaintext.as_slice());
         Ok(owner_seed)
     }
@@ -397,7 +446,7 @@ impl OwnershipGuard {
         &self,
         owner_seed: &[u8; 32],
     ) -> Result<OwnerVolumeKeys, OwnershipError> {
-        let hkdf = Hkdf::<Sha256>::new(None, owner_seed);
+        let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(None, owner_seed));
 
         let mut app_data = [0u8; 32];
         if let Err(err) = hkdf.expand(OWNER_LUKS_APP_DATA_INFO, &mut app_data) {
@@ -419,9 +468,9 @@ impl OwnershipGuard {
         &self,
         owner_seed: &[u8; 32],
     ) -> Result<SigningKey, OwnershipError> {
-        let hkdf = Hkdf::<Sha256>::new(None, owner_seed);
-        let mut signing_seed = [0u8; 32];
-        hkdf.expand(OWNER_ED25519_SEED_INFO, &mut signing_seed)
+        let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(None, owner_seed));
+        let mut signing_seed = Zeroizing::new([0u8; 32]);
+        hkdf.expand(OWNER_ED25519_SEED_INFO, &mut signing_seed[..])
             .map_err(|err| OwnershipError::Kdf(err.to_string()))?;
         Ok(SigningKey::from_bytes(&signing_seed))
     }
@@ -438,7 +487,10 @@ impl OwnershipGuard {
             .map_err(|err| OwnershipError::Envelope(format!("mnemonic_encode_failed:{err}")))
     }
 
-    pub fn owner_seed_from_mnemonic(&self, mnemonic: &str) -> Result<[u8; 32], OwnershipError> {
+    pub fn owner_seed_from_mnemonic(
+        &self,
+        mnemonic: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         let parsed = Mnemonic::parse_in_normalized(Language::English, mnemonic)
             .map_err(|err| OwnershipError::Envelope(format!("mnemonic_parse_failed:{err}")))?;
         let entropy = parsed.to_entropy();
@@ -448,17 +500,20 @@ impl OwnershipGuard {
                 entropy.len()
             )));
         }
-        let mut owner_seed = [0u8; 32];
+        let mut owner_seed = Zeroizing::new([0u8; 32]);
         owner_seed.copy_from_slice(&entropy);
         Ok(owner_seed)
     }
 
-    pub fn derive_sealing_wrap_key(&self, instance_id: &str) -> Result<[u8; 32], OwnershipError> {
+    pub fn derive_sealing_wrap_key(
+        &self,
+        instance_id: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         if instance_id.is_empty() {
             return Err(OwnershipError::InstanceIdMissing);
         }
         #[cfg(test)]
-        let base_key = {
+        let base_key = Zeroizing::new({
             let digest = Sha256::digest(
                 [
                     b"attestation-proxy-test-seal-key-v1:".as_slice(),
@@ -469,16 +524,47 @@ impl OwnershipGuard {
             let mut key = [0u8; 32];
             key.copy_from_slice(&digest[..32]);
             key
-        };
+        });
         #[cfg(not(test))]
         let base_key =
             crate::sev::derive_measurement_policy_key().map_err(OwnershipError::Store)?;
         let salt = Sha256::digest(instance_id.as_bytes());
-        let hkdf = Hkdf::<Sha256>::new(Some(salt.as_slice()), &base_key);
-        let mut derived = [0u8; 32];
-        hkdf.expand(OWNER_SEED_SEAL_INFO, &mut derived)
+        let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(Some(salt.as_slice()), &base_key[..]));
+        let mut derived = Zeroizing::new([0u8; 32]);
+        hkdf.expand(OWNER_SEED_SEAL_INFO, &mut derived[..])
             .map_err(|err| OwnershipError::Kdf(err.to_string()))?;
         Ok(derived)
+    }
+
+    pub fn signed_owner_audit_event(
+        &self,
+        owner_seed: &[u8; 32],
+        instance_id: &str,
+        ownership_mode: &str,
+        action: &str,
+        details: Value,
+    ) -> Result<Value, OwnershipError> {
+        let signing_key = self.derive_owner_signing_key(owner_seed)?;
+        let verifying_key = signing_key.verifying_key();
+        let payload = json!({
+            "kind": "owner_seed_audit",
+            "version": OWNER_AUDIT_EVENT_VERSION,
+            "timestamp": utc_now(),
+            "instance_id": instance_id,
+            "ownership_mode": ownership_mode,
+            "action": action,
+            "details": details,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
+            OwnershipError::Envelope(format!("audit_payload_encode_failed:{err}"))
+        })?;
+        let signature = signing_key.sign(&payload_bytes);
+        Ok(json!({
+            "payload": payload,
+            "signing_alg": "ed25519",
+            "owner_public_key": URL_SAFE_NO_PAD.encode(verifying_key.as_bytes()),
+            "signature": URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }))
     }
 
     pub fn write_handoff_key(&self, key: &[u8; 32]) -> Result<(), OwnershipError> {
@@ -817,6 +903,7 @@ pub fn utc_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -857,7 +944,7 @@ mod tests {
             .derive_luks_key(&mut password, "instance-abc")
             .expect("kdf should succeed");
         assert_eq!(
-            to_hex(&key),
+            to_hex(&key[..]),
             "53713008dae51be0b32cb3815404c355483bc629703f80f26095ede6144c1182"
         );
         assert_eq!(key.len(), 32);
@@ -874,7 +961,7 @@ mod tests {
             .derive_password_wrap_key(&mut password, "instance-abc")
             .expect("wrap key should succeed");
         assert_eq!(
-            to_hex(&wrap_key),
+            to_hex(&wrap_key[..]),
             "2c7b877bebfd61a2c243b049e6af6f846bfe8cfce47063ebc4aba70e17b1d783"
         );
 
@@ -904,7 +991,7 @@ mod tests {
         let decrypted = guard
             .decrypt_owner_seed(envelope.as_bytes(), &wrap_key)
             .expect("seed decrypt should succeed");
-        assert_eq!(decrypted, owner_seed);
+        assert_eq!(&*decrypted, &owner_seed);
 
         let keys = guard
             .derive_owner_volume_keys(&owner_seed)
@@ -993,6 +1080,65 @@ mod tests {
         assert!(
             password.iter().all(|byte| *byte == 0),
             "caller-owned password buffer must be zeroized by derive_luks_key"
+        );
+    }
+
+    #[test]
+    fn signed_owner_audit_event_is_verifiable() {
+        let signal_dir = test_signal_dir("signed-owner-audit");
+        let guard =
+            OwnershipGuard::new_with_signal_dir("password".to_string(), signal_dir.path.clone());
+        let owner_seed = [0x7a; 32];
+
+        let event = guard
+            .signed_owner_audit_event(
+                &owner_seed,
+                "instance-abc",
+                "password",
+                "recover",
+                json!({"warning": "auto_unlock_reseal_failed"}),
+            )
+            .expect("sign owner audit event");
+        let payload = event.get("payload").cloned().expect("payload");
+        let payload_bytes = serde_json::to_vec(&payload).expect("payload bytes");
+
+        let owner_public_key = URL_SAFE_NO_PAD
+            .decode(
+                event
+                    .get("owner_public_key")
+                    .and_then(Value::as_str)
+                    .expect("owner public key")
+                    .as_bytes(),
+            )
+            .expect("decode owner public key");
+        let owner_public_key: [u8; 32] = owner_public_key
+            .try_into()
+            .expect("owner public key length");
+        let verifying_key =
+            VerifyingKey::from_bytes(&owner_public_key).expect("parse verifying key");
+
+        let signature = URL_SAFE_NO_PAD
+            .decode(
+                event
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .expect("signature")
+                    .as_bytes(),
+            )
+            .expect("decode signature");
+        let signature: [u8; 64] = signature.try_into().expect("signature length");
+        let signature = Signature::from_bytes(&signature);
+
+        verifying_key
+            .verify(&payload_bytes, &signature)
+            .expect("verify audit signature");
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("recover")
+        );
+        assert_eq!(
+            payload.get("version").and_then(Value::as_str),
+            Some(OWNER_AUDIT_EVENT_VERSION)
         );
     }
 

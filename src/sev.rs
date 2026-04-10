@@ -6,6 +6,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use zeroize::{Zeroize, Zeroizing};
 
 const SEV_GUEST_DEVICE: &str = "/dev/sev-guest";
 const SNP_GET_DERIVED_KEY: libc::c_ulong = 0xC0205301;
@@ -27,6 +28,12 @@ struct SnpDerivedKeyReq {
 #[repr(C)]
 struct SnpDerivedKeyResp {
     data: [u8; 64],
+}
+
+impl Drop for SnpDerivedKeyResp {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
 }
 
 #[repr(C)]
@@ -95,7 +102,7 @@ fn extract_vmm_error(exitinfo2: u64) -> u32 {
     (exitinfo2 >> 32) as u32
 }
 
-pub fn derive_measurement_policy_key() -> Result<[u8; 32], String> {
+pub fn derive_measurement_policy_key() -> Result<Zeroizing<[u8; 32]>, String> {
     let _guard = ioctl_lock()
         .lock()
         .map_err(|_| "sev_guest_lock_poisoned".to_string())?;
@@ -143,17 +150,18 @@ pub fn derive_measurement_policy_key() -> Result<[u8; 32], String> {
         ));
     }
 
-    let mut first = [0u8; 32];
-    first.copy_from_slice(&resp.data[..32]);
-    if first.iter().any(|byte| *byte != 0) {
-        return Ok(first);
+    let mut derived = Zeroizing::new([0u8; 32]);
+    derived.copy_from_slice(&resp.data[..32]);
+    if derived.iter().any(|byte| *byte != 0) {
+        return Ok(derived);
     }
 
-    let mut second = [0u8; 32];
-    second.copy_from_slice(&resp.data[32..64]);
-    if second.iter().any(|byte| *byte != 0) {
-        return Ok(second);
+    derived.zeroize();
+    derived.copy_from_slice(&resp.data[32..64]);
+    if derived.iter().any(|byte| *byte != 0) {
+        return Ok(derived);
     }
 
+    derived.zeroize();
     Err("sev_guest_derived_key_zero".to_string())
 }

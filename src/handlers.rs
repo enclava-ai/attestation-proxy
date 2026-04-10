@@ -227,6 +227,33 @@ async fn fetch_ownership_identity(state: &AppState) -> OwnershipIdentity {
     }
 }
 
+fn emit_signed_owner_audit_event(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+    action: &str,
+    details: Value,
+) {
+    match state.ownership.signed_owner_audit_event(
+        owner_seed,
+        &state.config.instance_id,
+        &state.config.storage_ownership_mode,
+        action,
+        details,
+    ) {
+        Ok(event) => eprintln!("{event}"),
+        Err(err) => eprintln!(
+            "{}",
+            json!({
+                "kind": "owner_seed_audit_error",
+                "timestamp": utc_now(),
+                "instance_id": state.config.instance_id.as_str(),
+                "action": action,
+                "error": err.to_string(),
+            })
+        ),
+    }
+}
+
 fn decode_binary_field(value: &str) -> Result<Vec<u8>, OwnershipError> {
     let trimmed = value.trim();
     let decode_hex = || -> Result<Vec<u8>, OwnershipError> {
@@ -916,22 +943,31 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
             .ownership
             .derive_sealing_wrap_key(&state.config.instance_id)
         {
-            Ok(key) => Zeroizing::new(key),
+            Ok(key) => key,
             Err(_) => {
                 state.ownership.set_locked();
                 return;
             }
         };
         let owner_seed = match state.ownership.decrypt_owner_seed(&sealed, &wrap_key) {
-            Ok(seed) => Zeroizing::new(seed),
+            Ok(seed) => seed,
             Err(_) => {
                 state.ownership.set_locked();
                 return;
             }
         };
 
-        if let Err(err) = unlock_owner_seed_material(&state, &owner_seed).await {
-            state.ownership.set_error(err.to_string());
+        match unlock_owner_seed_material(&state, &owner_seed).await {
+            Ok(warning) => emit_signed_owner_audit_event(
+                &state,
+                &owner_seed,
+                "auto_unlock_resumed",
+                json!({
+                    "auto_unlock_enabled": true,
+                    "warning": warning,
+                }),
+            ),
+            Err(err) => state.ownership.set_error(err.to_string()),
         }
     });
 }
@@ -994,7 +1030,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
         .ownership
         .derive_luks_key(password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             state.ownership.set_error(err.to_string());
             return json_response(
@@ -1034,7 +1070,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
         .ownership
         .derive_password_wrap_key(password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             state.ownership.set_error(err.to_string());
             return json_response(
@@ -1065,7 +1101,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
         .ownership
         .decrypt_owner_seed(&owner_seed_resource, &wrap_key)
     {
-        Ok(owner_seed) => Zeroizing::new(owner_seed),
+        Ok(owner_seed) => owner_seed,
         Err(OwnershipError::WrongPassword) => {
             state.ownership.set_locked_after_retry();
             return json_response(200, &json!({"error": "wrong_password", "state": "locked"}));
@@ -1080,8 +1116,23 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
     };
 
     match unlock_owner_seed_material(state, &owner_seed).await {
-        Ok(None) => json_response(200, &json!({"state": "unlocked"})),
-        Ok(Some(warning)) => json_response(200, &json!({"state": "unlocked", "warning": warning})),
+        Ok(warning) => {
+            emit_signed_owner_audit_event(
+                state,
+                &owner_seed,
+                "unlock",
+                json!({
+                    "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+                    "warning": warning.clone(),
+                }),
+            );
+            match warning {
+                None => json_response(200, &json!({"state": "unlocked"})),
+                Some(warning) => {
+                    json_response(200, &json!({"state": "unlocked", "warning": warning}))
+                }
+            }
+        }
         Err(OwnershipError::WrongPassword) => {
             state.ownership.set_locked_after_retry();
             json_response(200, &json!({"error": "wrong_password", "state": "locked"}))
@@ -1324,7 +1375,7 @@ pub async fn bootstrap_claim(
         .ownership
         .derive_password_wrap_key(&mut password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1371,6 +1422,16 @@ pub async fn bootstrap_claim(
                 .ownership
                 .owner_public_key_b64url(&owner_seed)
                 .unwrap_or_default();
+            emit_signed_owner_audit_event(
+                &state,
+                &owner_seed,
+                "claim",
+                json!({
+                    "auto_unlock_enabled": false,
+                    "owner_public_key": owner_pubkey.clone(),
+                    "warning": warning.clone(),
+                }),
+            );
             {
                 let mut slot = state
                     .bootstrap_challenge
@@ -1424,7 +1485,7 @@ pub async fn change_password(
         .ownership
         .derive_password_wrap_key(&mut old_password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1436,7 +1497,7 @@ pub async fn change_password(
         material.encrypted.as_ref().expect("encrypted present"),
         &old_wrap_key,
     ) {
-        Ok(seed) => Zeroizing::new(seed),
+        Ok(seed) => seed,
         Err(OwnershipError::WrongPassword) => {
             return json_response(401, &json!({"error": "wrong_password"}))
         }
@@ -1451,7 +1512,7 @@ pub async fn change_password(
         .ownership
         .derive_password_wrap_key(&mut new_password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1485,6 +1546,18 @@ pub async fn change_password(
         );
     }
 
+    emit_signed_owner_audit_event(
+        &state,
+        &owner_seed,
+        "change_password",
+        json!({
+            "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+            "owner_public_key": state
+                .ownership
+                .owner_public_key_b64url(&owner_seed)
+                .unwrap_or_default(),
+        }),
+    );
     json_response(200, &json!({"status": "password_changed"}))
 }
 
@@ -1497,7 +1570,7 @@ pub async fn recover(
     }
 
     let owner_seed = match state.ownership.owner_seed_from_mnemonic(&payload.mnemonic) {
-        Ok(seed) => Zeroizing::new(seed),
+        Ok(seed) => seed,
         Err(err) => {
             return json_response(
                 400,
@@ -1510,7 +1583,7 @@ pub async fn recover(
         .ownership
         .derive_password_wrap_key(&mut new_password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1546,6 +1619,16 @@ pub async fn recover(
                 .ownership
                 .owner_public_key_b64url(&owner_seed)
                 .unwrap_or_default();
+            emit_signed_owner_audit_event(
+                &state,
+                &owner_seed,
+                "recover",
+                json!({
+                    "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+                    "owner_public_key": owner_pubkey.clone(),
+                    "warning": warning.clone(),
+                }),
+            );
             json_response(
                 200,
                 &json!({"status": "recovered", "state": "unlocked", "owner_public_key": owner_pubkey, "warning": warning}),
@@ -1583,7 +1666,7 @@ pub async fn enable_auto_unlock(
         .ownership
         .derive_password_wrap_key(&mut password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1595,7 +1678,7 @@ pub async fn enable_auto_unlock(
         material.encrypted.as_ref().expect("encrypted present"),
         &wrap_key,
     ) {
-        Ok(seed) => Zeroizing::new(seed),
+        Ok(seed) => seed,
         Err(OwnershipError::WrongPassword) => {
             return json_response(401, &json!({"error": "wrong_password"}))
         }
@@ -1610,7 +1693,7 @@ pub async fn enable_auto_unlock(
         .ownership
         .derive_sealing_wrap_key(&state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1640,6 +1723,18 @@ pub async fn enable_auto_unlock(
         );
     }
     state.ownership.set_auto_unlock_enabled(true);
+    emit_signed_owner_audit_event(
+        &state,
+        &owner_seed,
+        "enable_auto_unlock",
+        json!({
+            "auto_unlock_enabled": true,
+            "owner_public_key": state
+                .ownership
+                .owner_public_key_b64url(&owner_seed)
+                .unwrap_or_default(),
+        }),
+    );
     json_response(200, &json!({"status": "auto_unlock_enabled"}))
 }
 
@@ -1665,7 +1760,7 @@ pub async fn disable_auto_unlock(
         .ownership
         .derive_password_wrap_key(&mut password, &state.config.instance_id)
     {
-        Ok(key) => Zeroizing::new(key),
+        Ok(key) => key,
         Err(err) => {
             return json_response(
                 500,
@@ -1673,20 +1768,23 @@ pub async fn disable_auto_unlock(
             )
         }
     };
-    if let Err(err) = state.ownership.decrypt_owner_seed(
+    let owner_seed = match state.ownership.decrypt_owner_seed(
         material.encrypted.as_ref().expect("encrypted present"),
         &wrap_key,
     ) {
-        return match err {
-            OwnershipError::WrongPassword => {
-                json_response(401, &json!({"error": "wrong_password"}))
-            }
-            _ => json_response(
-                500,
-                &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()}),
-            ),
-        };
-    }
+        Ok(seed) => seed,
+        Err(err) => {
+            return match err {
+                OwnershipError::WrongPassword => {
+                    json_response(401, &json!({"error": "wrong_password"}))
+                }
+                _ => json_response(
+                    500,
+                    &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()}),
+                ),
+            };
+        }
+    };
     if let Err(err) =
         update_owner_seed_material(&state, EscrowValueUpdate::Keep, EscrowValueUpdate::Remove).await
     {
@@ -1696,6 +1794,18 @@ pub async fn disable_auto_unlock(
         );
     }
     state.ownership.set_auto_unlock_enabled(false);
+    emit_signed_owner_audit_event(
+        &state,
+        &owner_seed,
+        "disable_auto_unlock",
+        json!({
+            "auto_unlock_enabled": false,
+            "owner_public_key": state
+                .ownership
+                .owner_public_key_b64url(&owner_seed)
+                .unwrap_or_default(),
+        }),
+    );
     json_response(200, &json!({"status": "auto_unlock_disabled"}))
 }
 
@@ -2985,7 +3095,7 @@ mod tests {
         let wrap_key = guard
             .derive_password_wrap_key(&mut password, instance_id)
             .expect("derive password wrap key for test");
-        let cipher = Aes256Gcm::new_from_slice(&wrap_key).expect("cipher");
+        let cipher = Aes256Gcm::new_from_slice(&wrap_key[..]).expect("cipher");
         let nonce_bytes = [9u8; 12];
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
@@ -3125,7 +3235,7 @@ mod tests {
         state: &AppState,
         encrypted: &[u8],
         password: &str,
-    ) -> [u8; 32] {
+    ) -> Zeroizing<[u8; 32]> {
         decrypt_owner_seed_result(state, encrypted, password).expect("decrypt owner seed")
     }
 
@@ -3133,7 +3243,7 @@ mod tests {
         state: &AppState,
         encrypted: &[u8],
         password: &str,
-    ) -> Result<[u8; 32], OwnershipError> {
+    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
         let mut password = Zeroizing::new(password.as_bytes().to_vec());
         let wrap_key = state
             .ownership
