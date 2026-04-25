@@ -197,6 +197,12 @@ const ALLOWED_PATHS: &[&str] = &[
     "/.well-known/confidential/status",
 ];
 
+fn is_tls_seed_cdh_path(path: &str) -> bool {
+    path.starts_with("/cdh/resource/default/")
+        && path.ends_with("-tls/workload-secret-seed")
+        && !path.contains("/../")
+}
+
 struct OwnershipMachine {
     state: OwnershipState,
     error: Option<String>,
@@ -611,9 +617,29 @@ impl OwnershipGuard {
         &self,
         keys: &OwnerVolumeKeys,
     ) -> Result<(), OwnershipError> {
-        self.clear_password_handoff_key_files()?;
-        self.write_slot_handoff_key(SIGNAL_APP_DATA_SLOT, &keys.app_data)?;
-        self.write_slot_handoff_key(SIGNAL_TLS_DATA_SLOT, &keys.tls_data)?;
+        self.write_password_handoff_keys_for_slots(
+            keys,
+            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
+        )
+    }
+
+    pub fn write_password_handoff_keys_for_slots(
+        &self,
+        keys: &OwnerVolumeKeys,
+        slots: &[&str],
+    ) -> Result<(), OwnershipError> {
+        self.clear_password_handoff_key_files_for_slots(slots)?;
+        for slot in slots {
+            match *slot {
+                SIGNAL_APP_DATA_SLOT => self.write_slot_handoff_key(slot, &keys.app_data)?,
+                SIGNAL_TLS_DATA_SLOT => self.write_slot_handoff_key(slot, &keys.tls_data)?,
+                other => {
+                    return Err(OwnershipError::Envelope(format!(
+                        "unsupported_handoff_slot:{other}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -654,17 +680,31 @@ impl OwnershipGuard {
     }
 
     pub fn clear_password_handoff_key_files(&self) -> Result<(), OwnershipError> {
-        self.clear_slot_handoff_files(
-            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
-            &[SIGNAL_KEY_FILE],
-        )
+        self.clear_password_handoff_key_files_for_slots(&[
+            SIGNAL_APP_DATA_SLOT,
+            SIGNAL_TLS_DATA_SLOT,
+        ])
+    }
+
+    pub fn clear_password_handoff_key_files_for_slots(
+        &self,
+        slots: &[&str],
+    ) -> Result<(), OwnershipError> {
+        self.clear_slot_handoff_files(slots, &[SIGNAL_KEY_FILE])
     }
 
     pub fn clear_password_handoff_retry_files(&self) -> Result<(), OwnershipError> {
-        self.clear_slot_handoff_files(
-            &[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT],
-            &[SIGNAL_KEY_FILE, SIGNAL_ERROR_FILE],
-        )
+        self.clear_password_handoff_retry_files_for_slots(&[
+            SIGNAL_APP_DATA_SLOT,
+            SIGNAL_TLS_DATA_SLOT,
+        ])
+    }
+
+    pub fn clear_password_handoff_retry_files_for_slots(
+        &self,
+        slots: &[&str],
+    ) -> Result<(), OwnershipError> {
+        self.clear_slot_handoff_files(slots, &[SIGNAL_KEY_FILE, SIGNAL_ERROR_FILE])
     }
 
     pub fn poll_handoff_result(&self, timeout_secs: u64) -> Result<HandoffOutcome, OwnershipError> {
@@ -707,6 +747,14 @@ impl OwnershipGuard {
         timeout_secs: u64,
     ) -> Result<HandoffOutcome, OwnershipError> {
         self.poll_slot_handoff_result(&[SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT], timeout_secs)
+    }
+
+    pub fn poll_password_handoff_result_for_slots(
+        &self,
+        slots: &[&str],
+        timeout_secs: u64,
+    ) -> Result<HandoffOutcome, OwnershipError> {
+        self.poll_slot_handoff_result(slots, timeout_secs)
     }
 
     fn poll_slot_handoff_result(
@@ -771,6 +819,9 @@ impl OwnershipGuard {
     /// Returns true if the request should be blocked (gated).
     pub fn should_gate(&self, path: &str) -> bool {
         if !self.mode.requires_manual_unlock() {
+            return false;
+        }
+        if is_tls_seed_cdh_path(path) {
             return false;
         }
         let state = self.current_state();
@@ -966,7 +1017,10 @@ mod tests {
         guard.set_unclaimed();
         let (status, body) = guard.health_status();
         assert_eq!(status, 200);
-        assert_eq!(body.get("status").and_then(Value::as_str), Some("unclaimed"));
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("unclaimed")
+        );
         assert_eq!(body.get("state").and_then(Value::as_str), Some("unclaimed"));
         assert_eq!(
             body.get("auto_unlock_enabled").and_then(Value::as_bool),
@@ -974,6 +1028,12 @@ mod tests {
         );
         assert!(!guard.should_gate("/unlock"));
         assert!(guard.should_gate(gated_path));
+        assert!(
+            !guard.should_gate("/cdh/resource/default/instance-test-01-tls/workload-secret-seed")
+        );
+        assert!(
+            guard.should_gate("/cdh/resource/default/instance-test-01-state/workload-secret-seed")
+        );
 
         guard.set_locked();
         let (status, body) = guard.health_status();
@@ -1115,6 +1175,55 @@ mod tests {
             guard
                 .poll_password_handoff_result(1)
                 .expect("password handoff result"),
+            HandoffOutcome::Unlocked
+        );
+    }
+
+    #[test]
+    fn password_handoff_can_target_app_data_only() {
+        let signal_dir = test_signal_dir("password-app-data-only");
+        let guard =
+            OwnershipGuard::new_with_signal_dir("password".to_string(), signal_dir.path.clone());
+
+        let owner_seed = [0x25; 32];
+        let keys = guard
+            .derive_owner_volume_keys(&owner_seed)
+            .expect("derive owner volume keys");
+        guard
+            .write_password_handoff_keys_for_slots(&keys, &[SIGNAL_APP_DATA_SLOT])
+            .expect("write app-data key");
+
+        assert_eq!(
+            fs::read(
+                signal_dir
+                    .path
+                    .join(SIGNAL_APP_DATA_SLOT)
+                    .join(SIGNAL_KEY_FILE)
+            )
+            .expect("read app-data key"),
+            keys.app_data.to_vec()
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "tls-data key should not be written for app-data-only handoff"
+        );
+
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write app-data unlocked");
+        assert_eq!(
+            guard
+                .poll_password_handoff_result_for_slots(&[SIGNAL_APP_DATA_SLOT], 1)
+                .expect("poll app-data handoff"),
             HandoffOutcome::Unlocked
         );
     }

@@ -1,7 +1,9 @@
 pub mod attestation;
 pub mod config;
+pub mod config_store;
 pub mod escrow;
 pub mod handlers;
+pub mod jwt;
 pub mod kbs;
 pub mod ownership;
 pub mod sev;

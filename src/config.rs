@@ -34,6 +34,7 @@ pub struct Config {
     pub owner_ciphertext_backend: String,
     pub owner_seed_encrypted_kbs_path: String,
     pub owner_seed_sealed_kbs_path: String,
+    pub owner_seed_handoff_slots: Vec<String>,
     pub ownership_challenge_ttl_seconds: f64,
     // Kubernetes-secret backend fields (used when owner_ciphertext_backend = "kubernetes-secret")
     pub k8s_api_url: String,
@@ -43,6 +44,10 @@ pub struct Config {
     pub owner_escrow_encrypted_key: String,
     pub owner_escrow_sealed_key: String,
     pub owner_escrow_dir: String,
+    // CAP-specific fields
+    pub cap_api_signing_pubkey: String,
+    pub cap_api_url: String,
+    pub cap_config_dir: String,
 }
 
 impl Config {
@@ -69,6 +74,22 @@ impl Config {
             match std::env::var(key) {
                 Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
                 Err(_) => default,
+            }
+        }
+
+        fn env_handoff_slots() -> Vec<String> {
+            let raw = env_or("OWNER_SEED_HANDOFF_SLOTS", "app-data,tls-data");
+            let slots: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|slot| !slot.is_empty())
+                .filter(|slot| matches!(*slot, "app-data" | "tls-data"))
+                .map(ToString::to_string)
+                .collect();
+            if slots.is_empty() {
+                vec!["app-data".to_string(), "tls-data".to_string()]
+            } else {
+                slots
             }
         }
 
@@ -132,6 +153,7 @@ impl Config {
                     }
                 })
             },
+            owner_seed_handoff_slots: env_handoff_slots(),
             ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
             k8s_ca_cert_path: env_or(
@@ -146,6 +168,9 @@ impl Config {
             owner_escrow_encrypted_key: env_or("OWNER_ESCROW_ENCRYPTED_KEY", "seed-encrypted"),
             owner_escrow_sealed_key: env_or("OWNER_ESCROW_SEALED_KEY", "seed-sealed"),
             owner_escrow_dir: env_or("OWNER_ESCROW_DIR", "/run/owner-escrow"),
+            cap_api_signing_pubkey: env_or("CAP_API_SIGNING_PUBKEY", ""),
+            cap_api_url: env_or("CAP_API_URL", ""),
+            cap_config_dir: env_or("CAP_CONFIG_DIR", "/data/.enclava/config"),
         }
     }
 }
@@ -188,6 +213,7 @@ impl Config {
             owner_ciphertext_backend: "kbs-resource".into(),
             owner_seed_encrypted_kbs_path: "".into(),
             owner_seed_sealed_kbs_path: "".into(),
+            owner_seed_handoff_slots: vec!["app-data".into(), "tls-data".into()],
             ownership_challenge_ttl_seconds: 300.0,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
@@ -197,6 +223,9 @@ impl Config {
             owner_escrow_encrypted_key: "seed-encrypted".into(),
             owner_escrow_sealed_key: "seed-sealed".into(),
             owner_escrow_dir: "/run/owner-escrow".into(),
+            cap_api_signing_pubkey: "".into(),
+            cap_api_url: "".into(),
+            cap_config_dir: "/data/.enclava/config".into(),
         }
     }
 }
@@ -239,7 +268,11 @@ mod tests {
         "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
         "STORAGE_OWNERSHIP_MODE",
         "INSTANCE_ID",
+        "OWNER_SEED_HANDOFF_SLOTS",
         "HOSTNAME",
+        "CAP_API_SIGNING_PUBKEY",
+        "CAP_API_URL",
+        "CAP_CONFIG_DIR",
     ];
 
     fn clear_env() {
@@ -289,6 +322,10 @@ mod tests {
         assert_eq!(config.attestation_k8s_api_timeout_seconds, 6.0);
         assert_eq!(config.storage_ownership_mode, "legacy");
         assert_eq!(config.instance_id, "");
+        assert_eq!(
+            config.owner_seed_handoff_slots,
+            vec!["app-data", "tls-data"]
+        );
     }
 
     #[test]
@@ -342,5 +379,50 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn test_cap_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        let config = Config::from_env();
+        assert_eq!(config.cap_api_signing_pubkey, "");
+        assert_eq!(config.cap_api_url, "");
+        assert_eq!(config.cap_config_dir, "/data/.enclava/config");
+    }
+
+    #[test]
+    fn test_cap_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var("CAP_API_SIGNING_PUBKEY", "dGVzdC1rZXk");
+        std::env::set_var("CAP_API_URL", "https://api.enclava.dev");
+        std::env::set_var("CAP_CONFIG_DIR", "/custom/config");
+        let config = Config::from_env();
+        assert_eq!(config.cap_api_signing_pubkey, "dGVzdC1rZXk");
+        assert_eq!(config.cap_api_url, "https://api.enclava.dev");
+        assert_eq!(config.cap_config_dir, "/custom/config");
+    }
+
+    #[test]
+    fn test_owner_seed_handoff_slots_from_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var("OWNER_SEED_HANDOFF_SLOTS", "app-data");
+        let config = Config::from_env();
+        assert_eq!(config.owner_seed_handoff_slots, vec!["app-data"]);
+    }
+
+    #[test]
+    fn test_owner_seed_handoff_slots_ignore_unknown_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var("OWNER_SEED_HANDOFF_SLOTS", "unknown,tls-data");
+        let config = Config::from_env();
+        assert_eq!(config.owner_seed_handoff_slots, vec!["tls-data"]);
     }
 }

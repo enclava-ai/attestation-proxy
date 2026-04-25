@@ -81,6 +81,24 @@ fn begin_rate_limited_secret_operation(state: &AppState) -> Option<Response> {
     }
 }
 
+fn owner_seed_handoff_slots(state: &AppState) -> Vec<&'static str> {
+    let slots: Vec<&'static str> = state
+        .config
+        .owner_seed_handoff_slots
+        .iter()
+        .filter_map(|slot| match slot.as_str() {
+            SIGNAL_APP_DATA_SLOT => Some(SIGNAL_APP_DATA_SLOT),
+            SIGNAL_TLS_DATA_SLOT => Some(SIGNAL_TLS_DATA_SLOT),
+            _ => None,
+        })
+        .collect();
+    if slots.is_empty() {
+        vec![SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT]
+    } else {
+        slots
+    }
+}
+
 fn prune_bootstrap_challenges(
     challenges: &mut std::collections::VecDeque<BootstrapChallenge>,
     now: Instant,
@@ -667,6 +685,10 @@ pub async fn status(State(state): State<AppState>) -> Response {
     body["tenant_instance_identity_hash"] = json!(identity.tenant_instance_identity_hash);
     body["claims_verified"] = json!(identity.claims_verified);
     body["claims_error"] = json!(identity.claims_error);
+    // Config-ready state (CONF-04): reflects whether .ready sentinel exists
+    let config_ready =
+        crate::config_store::is_config_ready(std::path::Path::new(&state.config.cap_config_dir));
+    body["config_ready"] = json!(config_ready);
     json_response(200, &body)
 }
 
@@ -1269,11 +1291,14 @@ async fn unlock_owner_seed_material(
     state: &AppState,
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
+    let slots = owner_seed_handoff_slots(state);
     let owner_keys = Zeroizing::new(state.ownership.derive_owner_volume_keys(owner_seed)?);
-    state.ownership.write_password_handoff_keys(&owner_keys)?;
+    state
+        .ownership
+        .write_password_handoff_keys_for_slots(&owner_keys, &slots)?;
     let outcome = state
         .ownership
-        .poll_password_handoff_result(unlock_poll_timeout_seconds())?;
+        .poll_password_handoff_result_for_slots(&slots, unlock_poll_timeout_seconds())?;
     render_password_handoff_outcome(state, outcome, owner_seed).await
 }
 
@@ -1282,7 +1307,10 @@ async fn finalize_rewrapped_owner_seed(
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
     if state.ownership.is_unlocked() {
-        state.ownership.clear_password_handoff_retry_files()?;
+        let slots = owner_seed_handoff_slots(state);
+        state
+            .ownership
+            .clear_password_handoff_retry_files_for_slots(&slots)?;
         state.ownership.set_unlocked();
         return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
     }
@@ -1856,6 +1884,212 @@ pub async fn disable_auto_unlock(
     json_response(200, &json!({"status": "auto_unlock_disabled"}))
 }
 
+// ---------------------------------------------------------------------------
+// CAP config management handlers
+// ---------------------------------------------------------------------------
+
+/// Fire-and-forget metadata sync: tells the CAP API which config keys exist
+/// on this instance. Sends key names only (never values).
+fn spawn_config_metadata_sync(
+    http_client: &reqwest::Client,
+    api_url: &str,
+    instance_id: &str,
+    key: &str,
+    action: &str,
+    org_id: &str,
+    app_id: &str,
+) {
+    if api_url.is_empty() {
+        return;
+    }
+    let sync_url = format!("{api_url}/internal/apps/{instance_id}/config/sync");
+    let body = serde_json::json!({
+        "key": key,
+        "action": action,
+        "org_id": org_id,
+        "app_id": app_id,
+    });
+    let client = http_client.clone();
+    tokio::spawn(async move {
+        for attempt in 0..2u8 {
+            let result = client
+                .post(&sync_url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) => {
+                    eprintln!(
+                        "{{\"event\":\"config_metadata_sync_failed\",\"attempt\":{attempt},\"status\":{},\"url\":\"{sync_url}\"}}",
+                        resp.status().as_u16()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{{\"event\":\"config_metadata_sync_error\",\"attempt\":{attempt},\"error\":\"{e}\",\"url\":\"{sync_url}\"}}"
+                    );
+                }
+            }
+            if attempt == 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
+}
+
+/// PUT /config/{key} -- write a config value to the encrypted filesystem.
+/// JWT-authenticated via ConfigAuth extractor (requires config:write scope).
+pub async fn config_put(
+    State(state): State<AppState>,
+    crate::jwt::ConfigAuth(claims): crate::jwt::ConfigAuth,
+    Path(key): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+    match crate::config_store::write_config(config_dir, &key, &body) {
+        Ok(()) => {
+            // Write config-ready sentinel after first successful config write (CONF-04)
+            if let Err(e) = crate::config_store::write_ready_sentinel(config_dir) {
+                eprintln!("{{\"event\":\"config_ready_sentinel_failed\",\"error\":\"{e}\"}}");
+            }
+            spawn_config_metadata_sync(
+                &state.http_client,
+                &state.config.cap_api_url,
+                &state.config.instance_id,
+                &key,
+                "set",
+                &claims.org_id,
+                &claims.app_id,
+            );
+            json_response(200, &json!({"status": "ok", "key": key}))
+        }
+        Err(crate::config_store::ConfigStoreError::InvalidKeyName(detail)) => {
+            json_response(400, &json!({"error": "invalid_key_name", "detail": detail}))
+        }
+        Err(e) => json_response(
+            500,
+            &json!({"error": "config_write_failed", "detail": e.to_string()}),
+        ),
+    }
+}
+
+/// GET /config -- list all config key names (never values).
+/// JWT-authenticated via ConfigAuth extractor (requires config:write scope).
+pub async fn config_list(
+    State(state): State<AppState>,
+    crate::jwt::ConfigAuth(_claims): crate::jwt::ConfigAuth,
+) -> Response {
+    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+    match crate::config_store::list_config_keys(config_dir) {
+        Ok(keys) => json_response(200, &json!({"keys": keys})),
+        Err(e) => json_response(
+            500,
+            &json!({"error": "config_list_failed", "detail": e.to_string()}),
+        ),
+    }
+}
+
+/// DELETE /config/{key} -- remove a config key from the encrypted filesystem.
+/// JWT-authenticated via ConfigAuth extractor (requires config:write scope).
+pub async fn config_delete(
+    State(state): State<AppState>,
+    crate::jwt::ConfigAuth(claims): crate::jwt::ConfigAuth,
+    Path(key): Path<String>,
+) -> Response {
+    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+    match crate::config_store::delete_config(config_dir, &key) {
+        Ok(existed) => {
+            spawn_config_metadata_sync(
+                &state.http_client,
+                &state.config.cap_api_url,
+                &state.config.instance_id,
+                &key,
+                "delete",
+                &claims.org_id,
+                &claims.app_id,
+            );
+            json_response(
+                200,
+                &json!({"status": "ok", "key": key, "existed": existed}),
+            )
+        }
+        Err(crate::config_store::ConfigStoreError::InvalidKeyName(detail)) => {
+            json_response(400, &json!({"error": "invalid_key_name", "detail": detail}))
+        }
+        Err(e) => json_response(
+            500,
+            &json!({"error": "config_delete_failed", "detail": e.to_string()}),
+        ),
+    }
+}
+
+/// POST /teardown -- delete owner ciphertext from KBS (seed-encrypted and seed-sealed).
+/// JWT-authenticated via TeardownAuth extractor (requires teardown scope).
+pub async fn teardown(
+    State(state): State<AppState>,
+    crate::jwt::TeardownAuth(claims): crate::jwt::TeardownAuth,
+) -> Response {
+    let now = utc_now();
+    let instance_id = &state.config.instance_id;
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    // Delete seed-encrypted (required)
+    match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_encrypted_kbs_path)
+        .await
+    {
+        Ok(()) => deleted.push("seed-encrypted"),
+        Err(e) => errors.push(format!("seed-encrypted:{e}")),
+    }
+
+    // Delete seed-sealed (best effort -- 404 is OK since not all modes use it)
+    match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_sealed_kbs_path).await
+    {
+        Ok(()) => deleted.push("seed-sealed"),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains(":404:") {
+                deleted.push("seed-sealed"); // Treat 404 as success for sealed
+            } else {
+                errors.push(format!("seed-sealed:{e}"));
+            }
+        }
+    }
+
+    // Audit log
+    eprintln!(
+        "{{\"event\":\"teardown\",\"version\":\"{}\",\"timestamp\":\"{now}\",\"instance_id\":\"{instance_id}\",\"org_id\":\"{}\",\"app_id\":\"{}\",\"deleted\":{},\"errors\":{}}}",
+        crate::ownership::OWNER_AUDIT_EVENT_VERSION,
+        claims.org_id,
+        claims.app_id,
+        serde_json::to_string(&deleted).unwrap_or_default(),
+        serde_json::to_string(&errors).unwrap_or_default(),
+    );
+
+    if errors.is_empty() {
+        json_response(
+            200,
+            &json!({
+                "status": "teardown_complete",
+                "deleted": deleted,
+                "instance_id": instance_id,
+            }),
+        )
+    } else {
+        json_response(
+            500,
+            &json!({
+                "error": "teardown_partial_failure",
+                "errors": errors,
+                "deleted": deleted,
+                "instance_id": instance_id,
+            }),
+        )
+    }
+}
+
 /// Fallback handler for unmatched routes.
 pub async fn not_found(req: axum::extract::Request) -> Response {
     let path = req.uri().path().to_string();
@@ -2047,6 +2281,7 @@ mod tests {
             "tenant_instance_identity_hash",
             "claims_verified",
             "claims_error",
+            "config_ready",
         ]
         .into_iter()
         .map(str::to_string)
@@ -2067,7 +2302,10 @@ mod tests {
             body.get("ciphertext_backend").and_then(Value::as_str),
             Some(expected_ciphertext_backend.as_str())
         );
-        assert_eq!(body.get("tenant_id").and_then(Value::as_str), Some("tenant-test"));
+        assert_eq!(
+            body.get("tenant_id").and_then(Value::as_str),
+            Some("tenant-test")
+        );
         assert_eq!(
             body.get("claims_instance_id").and_then(Value::as_str),
             Some("instance-test-01")
@@ -2311,6 +2549,58 @@ mod tests {
                 .join(SIGNAL_KEY_FILE)
                 .exists(),
             "tls-data key file should be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_password_mode_can_target_app_data_only() {
+        let signal_dir = test_signal_dir("unlock-password-app-data-only");
+        let owner_seed = [0x24; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let state = build_state_with_mode_and_slots(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+            vec![SIGNAL_APP_DATA_SLOT.to_string()],
+        );
+
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write app unlocked sentinel");
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("correct-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert!(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "app-data key file should be written"
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "tls-data key file should not be written when CAP owns TLS via a separate seed"
         );
     }
 
@@ -3015,11 +3305,31 @@ mod tests {
         base_url: String,
         owner_seed_encrypted_kbs_path: Option<String>,
     ) -> AppState {
+        build_state_with_mode_and_slots(
+            signal_dir,
+            mode,
+            base_url,
+            owner_seed_encrypted_kbs_path,
+            vec![
+                SIGNAL_APP_DATA_SLOT.to_string(),
+                SIGNAL_TLS_DATA_SLOT.to_string(),
+            ],
+        )
+    }
+
+    fn build_state_with_mode_and_slots(
+        signal_dir: &PathBuf,
+        mode: &str,
+        base_url: String,
+        owner_seed_encrypted_kbs_path: Option<String>,
+        owner_seed_handoff_slots: Vec<String>,
+    ) -> AppState {
         let mut config = Config::from_env_for_test();
         config.storage_ownership_mode = mode.to_string();
         config.instance_id = "instance-test-01".to_string();
         config.kbs_resource_url = format!("{base_url}/kbs/v0/resource");
         config.aa_token_url = format!("{base_url}/aa/token");
+        config.owner_seed_handoff_slots = owner_seed_handoff_slots;
         config.owner_seed_encrypted_kbs_path = owner_seed_encrypted_kbs_path.unwrap_or_default();
         config.owner_ciphertext_backend = if config.owner_seed_encrypted_kbs_path.is_empty() {
             "kubernetes-secret".to_string()
@@ -3569,6 +3879,164 @@ mod tests {
         state.ownership.decrypt_owner_seed(encrypted, &wrap_key)
     }
 
+    // -----------------------------------------------------------------------
+    // CAP config handler conformance tests
+    // -----------------------------------------------------------------------
+
+    fn test_config_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "attestation-proxy-config-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn test_api_claims(instance_id: &str, scope: &str) -> crate::jwt::ApiTokenClaims {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        crate::jwt::ApiTokenClaims {
+            org_id: "test-org".to_string(),
+            app_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            instance_id: instance_id.to_string(),
+            scopes: vec![scope.to_string()],
+            iat: now,
+            exp: now + 300,
+        }
+    }
+
+    fn build_config_test_state(config_dir: &Path) -> AppState {
+        let signal_dir = test_signal_dir("config-test");
+        let mut config = Config::from_env_for_test();
+        config.storage_ownership_mode = "password".to_string();
+        config.instance_id = "instance-test-01".to_string();
+        config.cap_config_dir = config_dir.display().to_string();
+        // Empty api_url means metadata sync is a no-op
+        config.cap_api_url = "".to_string();
+
+        let state = AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                "password".to_string(),
+                signal_dir.path.clone(),
+            )),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        };
+        // Unlock so ownership gate does not interfere
+        state.ownership.set_unlocked();
+        // Leak signal_dir to prevent cleanup during test
+        std::mem::forget(signal_dir);
+        state
+    }
+
+    #[tokio::test]
+    async fn config_put_writes_to_filesystem() {
+        let dir = test_config_dir("put-writes");
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["key"], "DATABASE_URL");
+
+        // Verify file was written
+        let content = fs::read(dir.join("DATABASE_URL")).expect("config file should exist");
+        assert_eq!(content, b"postgres://localhost/mydb");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_list_returns_sorted_keys() {
+        let dir = test_config_dir("list-sorted");
+        // Pre-populate with keys in non-alphabetical order
+        crate::config_store::write_config(&dir, "Z_KEY", b"z").unwrap();
+        crate::config_store::write_config(&dir, "A_KEY", b"a").unwrap();
+
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_list(State(state), crate::jwt::ConfigAuth(claims)).await;
+
+        let body = read_json(response).await;
+        let keys: Vec<String> = body["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, vec!["A_KEY", "Z_KEY"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_delete_removes_key() {
+        let dir = test_config_dir("delete-removes");
+        // Pre-populate
+        crate::config_store::write_config(&dir, "TEMP_KEY", b"temp").unwrap();
+
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_delete(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("TEMP_KEY".to_string()),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["key"], "TEMP_KEY");
+        assert_eq!(body["existed"], true);
+
+        // Verify file is gone
+        assert!(!dir.join("TEMP_KEY").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_rejects_invalid_key_name() {
+        let dir = test_config_dir("put-invalid");
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("invalid-key-name".to_string()),
+            Bytes::from_static(b"some-value"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_key_name");
+
+        // Verify no file was created
+        assert!(!dir.join("invalid-key-name").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn mark_password_slots_unlocked(signal_dir: &Path) {
         for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
             let slot_dir = signal_dir.join(slot);
@@ -3584,5 +4052,89 @@ mod tests {
                 let _ = fs::remove_file(signal_dir.join(slot).join(name));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_status_includes_config_ready() {
+        let dir = test_config_dir("status-config-ready");
+        let signal_dir = test_signal_dir("status-config-ready");
+        let mut config = Config::from_env_for_test();
+        config.storage_ownership_mode = "password".to_string();
+        config.instance_id = "instance-test-01".to_string();
+        config.cap_config_dir = dir.display().to_string();
+        config.owner_seed_encrypted_kbs_path =
+            "default/instance-test-01-owner/seed-encrypted".to_string();
+        config.owner_seed_sealed_kbs_path =
+            "default/instance-test-01-owner/seed-sealed".to_string();
+
+        let state = AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                "password".to_string(),
+                signal_dir.path.clone(),
+            )),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        };
+
+        // Status should include config_ready = false (no sentinel yet)
+        let response = status(State(state.clone())).await;
+        let body = read_json(response).await;
+        assert_eq!(
+            body["config_ready"],
+            json!(false),
+            "config_ready should be false before sentinel"
+        );
+
+        // Write sentinel and check again
+        crate::config_store::write_ready_sentinel(std::path::Path::new(
+            &state.config.cap_config_dir,
+        ))
+        .unwrap();
+        let response = status(State(state)).await;
+        let body = read_json(response).await;
+        assert_eq!(
+            body["config_ready"],
+            json!(true),
+            "config_ready should be true after sentinel"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_writes_ready_sentinel() {
+        let dir = test_config_dir("put-sentinel");
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        // No sentinel before first config write
+        assert!(!dir.join(".ready").exists(), ".ready should not exist yet");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("MY_SECRET".to_string()),
+            Bytes::from_static(b"secret-value"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+
+        // Sentinel should now exist
+        assert!(
+            dir.join(".ready").exists(),
+            ".ready should exist after config_put"
+        );
+        let content = fs::read_to_string(dir.join(".ready")).unwrap();
+        assert!(
+            content.starts_with("ready_at="),
+            "sentinel should start with ready_at="
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

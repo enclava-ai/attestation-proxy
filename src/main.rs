@@ -8,7 +8,7 @@ use axum::extract::State;
 use axum::http::{header, Request};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,15 @@ async fn main() {
     handlers::initialize_ownership_state(&state).await;
     handlers::spawn_auto_unlock_if_needed(state.clone());
 
+    // If CAP config management is not configured (no signing pubkey), write .ready sentinel
+    // immediately so bootstrap.sh does not block waiting for config that will never arrive (D-07).
+    if state.config.cap_api_signing_pubkey.is_empty() {
+        let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+        if let Err(e) = attestation_proxy::config_store::write_ready_sentinel(config_dir) {
+            eprintln!("{{\"event\":\"config_ready_sentinel_startup_failed\",\"error\":\"{e}\"}}");
+        }
+    }
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/status", get(handlers::status))
@@ -90,6 +99,26 @@ async fn main() {
             "/.well-known/confidential/bootstrap/claim",
             post(handlers::bootstrap_claim),
         )
+        // CAP config routes (JWT-authenticated, ownership-gated)
+        .route(
+            "/.well-known/confidential/config/{key}",
+            put(handlers::config_put).delete(handlers::config_delete),
+        )
+        .route(
+            "/config/{key}",
+            put(handlers::config_put).delete(handlers::config_delete),
+        )
+        .route(
+            "/.well-known/confidential/config",
+            get(handlers::config_list),
+        )
+        .route("/config", get(handlers::config_list))
+        // CAP teardown route (JWT-authenticated, ownership-gated)
+        .route(
+            "/.well-known/confidential/teardown",
+            post(handlers::teardown),
+        )
+        .route("/teardown", post(handlers::teardown))
         .fallback(handlers::not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -106,6 +135,26 @@ async fn main() {
 mod main {
     mod tests {
         use attestation_proxy::ownership::OwnershipGuard;
+
+        #[test]
+        fn ownership_gate_blocks_config_and_teardown_when_locked() {
+            let guard = OwnershipGuard::new("level1".to_string());
+            // Config and teardown are gated (blocked when locked)
+            assert!(guard.should_gate("/.well-known/confidential/config/MY_KEY"));
+            assert!(guard.should_gate("/.well-known/confidential/config"));
+            assert!(guard.should_gate("/.well-known/confidential/teardown"));
+            assert!(guard.should_gate("/config/MY_KEY"));
+            assert!(guard.should_gate("/config"));
+            assert!(guard.should_gate("/teardown"));
+
+            guard.set_unlocked();
+            assert!(!guard.should_gate("/.well-known/confidential/config/MY_KEY"));
+            assert!(!guard.should_gate("/.well-known/confidential/config"));
+            assert!(!guard.should_gate("/.well-known/confidential/teardown"));
+            assert!(!guard.should_gate("/config/MY_KEY"));
+            assert!(!guard.should_gate("/config"));
+            assert!(!guard.should_gate("/teardown"));
+        }
 
         #[test]
         fn ownership_gate_state_behavior() {
