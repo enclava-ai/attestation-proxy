@@ -20,6 +20,9 @@ pub struct KbsCacheEntry {
     pub error_until: Instant,
 }
 
+type CachedResourceBody = (Vec<u8>, String, u16);
+type CachedResourceLookup = (Option<CachedResourceBody>, Option<Value>);
+
 impl KbsCacheEntry {
     /// Returns true if the cache entry has valid (non-expired) content.
     pub fn is_valid(&self) -> bool {
@@ -49,7 +52,7 @@ fn cdh_resource_base(aa_token_url: &str, aa_evidence_url: &str) -> String {
 fn cached_resource_entry(
     cache: &mut std::collections::HashMap<String, KbsCacheEntry>,
     cache_key: &str,
-) -> (Option<(Vec<u8>, String, u16)>, Option<Value>) {
+) -> CachedResourceLookup {
     if let Some(entry) = cache.get(cache_key) {
         if entry.is_valid() {
             return (
@@ -284,11 +287,8 @@ pub async fn evict_kbs_cache_entry(state: &crate::AppState, cache_key: &str) {
 /// E.g. "http://host:8080/kbs/v0/resource" -> "http://host:8080/kbs/v0/workload-resource"
 fn workload_resource_base(kbs_resource_url: &str) -> String {
     let base = kbs_resource_url.trim_end_matches('/');
-    if base.ends_with("/resource") {
-        format!(
-            "{}/workload-resource",
-            &base[..base.len() - "/resource".len()]
-        )
+    if let Some(stripped) = base.strip_suffix("/resource") {
+        format!("{stripped}/workload-resource")
     } else {
         format!("{}/workload-resource", base)
     }

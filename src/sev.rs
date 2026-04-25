@@ -88,7 +88,7 @@ fn ensure_sev_guest_device(path: &Path) -> Result<(), String> {
     let path_cstr = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "sev_guest_path_contains_nul".to_string())?;
     let mode = libc::S_IFCHR | 0o600;
-    let dev = libc::makedev(10, minor.into());
+    let dev = libc::makedev(10, minor);
     let rc = unsafe { libc::mknod(path_cstr.as_ptr(), mode, dev) };
     if rc != 0 {
         let err = io::Error::last_os_error();

@@ -132,6 +132,12 @@ pub struct AaTokenCache {
     pub error_until: Instant,
 }
 
+impl Default for AaTokenCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AaTokenCache {
     pub fn new() -> Self {
         Self {
@@ -759,7 +765,7 @@ pub fn select_claims_root(
             claims_root = parsed.clone();
             claims_source = "evidence_jwt".to_string();
             // Prefer tokens with attestation-specific keys
-            if parsed.as_object().map_or(false, |o| {
+            if parsed.as_object().is_some_and(|o| {
                 o.contains_key("snp")
                     || o.contains_key("submods")
                     || o.contains_key("init_data_claims")
@@ -771,13 +777,13 @@ pub fn select_claims_root(
     }
 
     // If no good claims from evidence, fall back to AA token claims
-    let has_attestation_keys = claims_root.as_object().map_or(false, |o| {
+    let has_attestation_keys = claims_root.as_object().is_some_and(|o| {
         o.contains_key("snp")
             || o.contains_key("submods")
             || o.contains_key("init_data_claims")
             || o.contains_key("init_data")
     });
-    if (!has_attestation_keys || claims_root.as_object().map_or(true, |o| o.is_empty()))
+    if (!has_attestation_keys || claims_root.as_object().is_none_or(|o| o.is_empty()))
         && supplemental_claims.is_some()
     {
         if let Some(sc) = supplemental_claims {
@@ -811,7 +817,7 @@ pub fn extract_claims(
     let init_data_hash = extract_init_data_hash(&claims_root);
     let measurement = report
         .and_then(|r| r.get("measurement"))
-        .and_then(|v| to_hex_bytes(v));
+        .and_then(to_hex_bytes);
 
     let tee = if attestation_profile.to_lowercase().contains("sev-snp") {
         "sev-snp"

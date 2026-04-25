@@ -336,7 +336,7 @@ fn emit_signed_owner_audit_event(
 fn decode_binary_field(value: &str) -> Result<Vec<u8>, OwnershipError> {
     let trimmed = value.trim();
     let decode_hex = || -> Result<Vec<u8>, OwnershipError> {
-        if trimmed.len() % 2 != 0 {
+        if !trimmed.len().is_multiple_of(2) {
             return Err(OwnershipError::Envelope(
                 "binary_decode_failed:hex_length_invalid".to_string(),
             ));
@@ -3295,12 +3295,12 @@ mod tests {
         );
     }
 
-    fn build_state(signal_dir: &PathBuf) -> AppState {
+    fn build_state(signal_dir: &Path) -> AppState {
         build_state_with_mode(signal_dir, "level1", "http://127.0.0.1:9".to_string(), None)
     }
 
     fn build_state_with_mode(
-        signal_dir: &PathBuf,
+        signal_dir: &Path,
         mode: &str,
         base_url: String,
         owner_seed_encrypted_kbs_path: Option<String>,
@@ -3318,7 +3318,7 @@ mod tests {
     }
 
     fn build_state_with_mode_and_slots(
-        signal_dir: &PathBuf,
+        signal_dir: &Path,
         mode: &str,
         base_url: String,
         owner_seed_encrypted_kbs_path: Option<String>,
@@ -3349,14 +3349,14 @@ mod tests {
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
-                signal_dir.clone(),
+                signal_dir.to_path_buf(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
     fn build_state_with_secret_backend(
-        signal_dir: &PathBuf,
+        signal_dir: &Path,
         mode: &str,
         base_url: String,
         token_path: &Path,
@@ -3385,7 +3385,7 @@ mod tests {
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
-                signal_dir.clone(),
+                signal_dir.to_path_buf(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
@@ -3825,9 +3825,8 @@ mod tests {
     async fn claim_owner(state: &AppState, signing_key: &SigningKey, password: &str) -> Value {
         let challenge = bootstrap_challenge(State(state.clone())).await;
         let challenge_body = read_json(challenge).await;
-        assert_eq!(
+        assert!(
             challenge_body.get("error").is_none(),
-            true,
             "bootstrap challenge failed: {challenge_body}"
         );
         let challenge_b64 = challenge_body
@@ -3850,9 +3849,8 @@ mod tests {
         )
         .await;
         let body = read_json(response).await;
-        assert_eq!(
+        assert!(
             body.get("error").is_none(),
-            true,
             "bootstrap claim failed: {body}"
         );
         body
