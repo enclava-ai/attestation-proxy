@@ -8,7 +8,7 @@ use axum::http::{header, Response as HttpResponse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
@@ -25,6 +25,7 @@ use crate::ownership::{
     BootstrapChallenge, HandoffOutcome, OwnershipError, BOOTSTRAP_CHALLENGE_MAX_ACTIVE,
     SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
 };
+use crate::receipts::SignReceiptRequest;
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,8 @@ use crate::AppState;
 pub struct AttestationQuery {
     pub nonce: Option<String>,
     pub runtime_data: Option<String>,
+    pub leaf_spki_sha256: Option<String>,
+    pub domain: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -62,8 +65,119 @@ pub struct BootstrapClaimRequest {
     pub password: Zeroizing<String>,
 }
 
+fn receipt_error_response(err: crate::receipts::ReceiptError) -> Response {
+    let status = match err {
+        crate::receipts::ReceiptError::UnsupportedType
+        | crate::receipts::ReceiptError::InvalidAppId
+        | crate::receipts::ReceiptError::InvalidResourcePath
+        | crate::receipts::ReceiptError::NewValueHashRequired
+        | crate::receipts::ReceiptError::NewValueHashInvalid
+        | crate::receipts::ReceiptError::InvalidTimestamp
+        | crate::receipts::ReceiptError::InvalidUnlockTransitionFields => 400,
+    };
+    json_response(status, &json!({"error": err.to_string()}))
+}
+
 fn take_secret_bytes(secret: &mut Zeroizing<String>) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(std::mem::take(&mut **secret).into_bytes())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_base64_bytes(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.trim();
+    let padded = {
+        let pad = (4 - trimmed.len() % 4) % 4;
+        let mut out = trimmed.to_string();
+        for _ in 0..pad {
+            out.push('=');
+        }
+        out
+    };
+    URL_SAFE_NO_PAD
+        .decode(trimmed.as_bytes())
+        .or_else(|_| URL_SAFE.decode(padded.as_bytes()))
+        .or_else(|_| STANDARD.decode(trimmed.as_bytes()))
+        .ok()
+}
+
+fn decode_fixed32_base64(value: &str, field: &'static str) -> Result<[u8; 32], String> {
+    let bytes = decode_base64_bytes(value).ok_or_else(|| format!("{field}_base64_invalid"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{field}_length_invalid:{}", bytes.len()))
+}
+
+fn decode_hex32(value: &str, field: &'static str) -> Result<[u8; 32], String> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 {
+        return Err(format!("{field}_length_invalid:{}", trimmed.len()));
+    }
+    let mut out = [0u8; 32];
+    for (idx, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).map_err(|_| format!("{field}_hex_invalid"))?;
+        out[idx] = u8::from_str_radix(pair, 16).map_err(|_| format!("{field}_hex_invalid"))?;
+    }
+    Ok(out)
+}
+
+fn decode_sha256_field(value: &str, field: &'static str) -> Result<[u8; 32], String> {
+    let trimmed = value.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        decode_hex32(trimmed, field)
+    } else {
+        decode_fixed32_base64(trimmed, field)
+    }
+}
+
+fn validate_attestation_domain(value: &str) -> Result<String, String> {
+    let domain = value.trim().to_ascii_lowercase();
+    let valid = !domain.is_empty()
+        && domain.len() <= 253
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    if valid {
+        Ok(domain)
+    } else {
+        Err("domain_invalid".to_string())
+    }
+}
+
+fn tee_tls_transcript_hash(
+    domain: &str,
+    nonce: &[u8; 32],
+    leaf_spki_sha256: &[u8; 32],
+) -> [u8; 32] {
+    crate::receipts::ce_v1_hash(&[
+        ("purpose", b"enclava-tee-tls-v1"),
+        ("domain", domain.as_bytes()),
+        ("nonce", nonce),
+        ("leaf_spki_sha256", leaf_spki_sha256),
+    ])
+}
+
+fn build_report_data(
+    domain: &str,
+    nonce: &[u8; 32],
+    leaf_spki_sha256: &[u8; 32],
+    receipt_pubkey_sha256: &[u8; 32],
+) -> [u8; 64] {
+    let transcript_hash = tee_tls_transcript_hash(domain, nonce, leaf_spki_sha256);
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&transcript_hash);
+    report_data[32..64].copy_from_slice(receipt_pubkey_sha256);
+    report_data
 }
 
 fn rate_limited_response() -> Response {
@@ -585,15 +699,24 @@ async fn apply_kbs_owner_seed_update(
     state: &AppState,
     resource_path: &str,
     update: EscrowValueUpdate<'_>,
+    previous: Option<&[u8]>,
 ) -> Result<bool, OwnershipError> {
     match update {
         EscrowValueUpdate::Keep => Ok(false),
         EscrowValueUpdate::Remove => {
+            if previous.is_none() {
+                return Ok(false);
+            }
             kbs::delete_kbs_workload_resource(state, resource_path).await?;
             Ok(true)
         }
         EscrowValueUpdate::Set(bytes) => {
-            kbs::put_kbs_workload_resource(state, resource_path, bytes).await?;
+            let mode = if previous.is_some() {
+                kbs::WorkloadResourceWriteMode::Replace
+            } else {
+                kbs::WorkloadResourceWriteMode::Create
+            };
+            kbs::put_kbs_workload_resource(state, resource_path, bytes, mode).await?;
             Ok(true)
         }
     }
@@ -605,7 +728,15 @@ async fn restore_kbs_owner_seed_resource(
     previous: Option<&[u8]>,
 ) -> Result<(), OwnershipError> {
     match previous {
-        Some(bytes) => kbs::put_kbs_workload_resource(state, resource_path, bytes).await,
+        Some(bytes) => {
+            kbs::put_kbs_workload_resource(
+                state,
+                resource_path,
+                bytes,
+                kbs::WorkloadResourceWriteMode::Replace,
+            )
+            .await
+        }
         None => kbs::delete_kbs_workload_resource(state, resource_path).await,
     }
 }
@@ -626,12 +757,17 @@ async fn update_owner_seed_material(
                 state,
                 &state.config.owner_seed_encrypted_kbs_path,
                 encrypted,
+                previous.encrypted.as_deref(),
             )
             .await?;
 
-            if let Err(err) =
-                apply_kbs_owner_seed_update(state, &state.config.owner_seed_sealed_kbs_path, sealed)
-                    .await
+            if let Err(err) = apply_kbs_owner_seed_update(
+                state,
+                &state.config.owner_seed_sealed_kbs_path,
+                sealed,
+                previous.sealed.as_deref(),
+            )
+            .await
             {
                 if encrypted_changed {
                     if let Err(rollback_err) = restore_kbs_owner_seed_resource(
@@ -700,8 +836,12 @@ pub async fn attestation_info(State(state): State<AppState>) -> Response {
         "timestamp": utc_now(),
         "attestation_type": config.attestation_profile,
         "runtime_class": config.attestation_runtime_class,
-        "evidence_endpoint": "/v1/attestation?nonce=<base64-random>",
+        "evidence_endpoint": "/v1/attestation?nonce=<base64-32B>&domain=<host>&leaf_spki_sha256=<hex-or-base64-32B>",
         "nonce_encoding": "base64",
+        "runtime_data_contract": {
+            "caller_supplied_runtime_data": false,
+            "report_data_layout": "transcript_hash[32] || receipt_pubkey_sha256[32]",
+        },
         "policy": build_policy_metadata(config),
         "endorsements": build_endorsement_metadata(config),
         "trust": {
@@ -712,47 +852,131 @@ pub async fn attestation_info(State(state): State<AppState>) -> Response {
     json_response(200, &payload)
 }
 
-/// GET /v1/attestation?nonce=<b64>
+/// GET /v1/attestation?nonce=<b64-32B>&domain=<host>&leaf_spki_sha256=<hex-or-b64-32B>
 pub async fn attestation(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,
 ) -> Response {
-    let nonce = query.nonce.or(query.runtime_data);
+    if query.runtime_data.is_some() {
+        return json_response(
+            400,
+            &json!({
+                "error": "runtime_data_rejected",
+                "detail": "runtime_data is constructed by attestation-proxy from nonce, domain, leaf_spki_sha256, and the in-TEE receipt public key.",
+                "timestamp": utc_now(),
+            }),
+        );
+    }
 
-    // Validate nonce presence
-    let nonce = match nonce {
+    let nonce = match query.nonce {
         Some(n) if !n.is_empty() => n,
         _ => {
             return json_response(
                 400,
                 &json!({
                     "error": "nonce_required",
-                    "detail": "Provide nonce via query parameter '?nonce=<base64>' (or '?runtime_data=<base64>').",
+                    "detail": "Provide nonce via query parameter '?nonce=<base64-32-byte-random>'.",
                     "timestamp": utc_now(),
                 }),
             );
         }
     };
 
-    // Validate nonce is valid base64
-    if !attestation::nonce_is_valid_b64(&nonce) {
+    let nonce_bytes = match decode_fixed32_base64(&nonce, "nonce") {
+        Ok(bytes) => bytes,
+        Err(detail) => {
+            return json_response(
+                400,
+                &json!({
+                    "error": "nonce_invalid",
+                    "detail": detail,
+                    "timestamp": utc_now(),
+                }),
+            )
+        }
+    };
+
+    let domain = match query.domain.as_deref().map(validate_attestation_domain) {
+        Some(Ok(domain)) => domain,
+        Some(Err(detail)) => {
+            return json_response(
+                400,
+                &json!({
+                    "error": "domain_invalid",
+                    "detail": detail,
+                    "timestamp": utc_now(),
+                }),
+            )
+        }
+        None => {
+            return json_response(
+                400,
+                &json!({
+                    "error": "domain_required",
+                    "detail": "Provide the externally verified TLS/SNI domain used for the confidential channel.",
+                    "timestamp": utc_now(),
+                }),
+            )
+        }
+    };
+
+    let leaf_spki_sha256 = match query
+        .leaf_spki_sha256
+        .as_deref()
+        .map(|value| decode_sha256_field(value, "leaf_spki_sha256"))
+    {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(detail)) => {
+            return json_response(
+                400,
+                &json!({
+                    "error": "leaf_spki_sha256_invalid",
+                    "detail": detail,
+                    "timestamp": utc_now(),
+                }),
+            )
+        }
+        None => {
+            return json_response(
+                400,
+                &json!({
+                    "error": "leaf_spki_sha256_required",
+                    "detail": "Provide SHA256(DER-encoded TLS leaf SubjectPublicKeyInfo).",
+                    "timestamp": utc_now(),
+                }),
+            )
+        }
+    };
+    if leaf_spki_sha256 != state.tls_leaf_spki_sha256 {
         return json_response(
             400,
             &json!({
-                "error": "nonce_invalid",
-                "detail": "nonce must be base64/url-safe-base64 encoded and <= 4096 chars",
+                "error": "leaf_spki_sha256_mismatch",
+                "detail": "leaf_spki_sha256 must match the attestation-proxy TLS leaf SPKI.",
+                "expected": hex_lower(&state.tls_leaf_spki_sha256),
                 "timestamp": utc_now(),
             }),
         );
     }
 
+    let receipt_pubkey_sha256 = state.receipt_signer.public_key_sha256();
+    let report_data = build_report_data(
+        &domain,
+        &nonce_bytes,
+        &leaf_spki_sha256,
+        &receipt_pubkey_sha256,
+    );
+    let aa_runtime_data = STANDARD.encode(report_data);
+
     // Fetch evidence from AA agent
-    let encoded_nonce =
-        percent_encoding::percent_encode(nonce.as_bytes(), percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
+    let encoded_runtime_data = percent_encoding::percent_encode(
+        aa_runtime_data.as_bytes(),
+        percent_encoding::NON_ALPHANUMERIC,
+    )
+    .to_string();
     let evidence_url = format!(
         "{}?runtime_data={}",
-        state.config.aa_evidence_url, encoded_nonce
+        state.config.aa_evidence_url, encoded_runtime_data
     );
 
     let evidence_result = state
@@ -929,6 +1153,12 @@ pub async fn attestation(
         "attestation_type": state.config.attestation_profile,
         "runtime_class": state.config.attestation_runtime_class,
         "nonce": nonce,
+        "runtime_data_binding": {
+            "scheme": "enclava-report-data-v1",
+            "domain": domain,
+            "leaf_spki_sha256": hex_lower(&leaf_spki_sha256),
+            "receipt_pubkey_sha256": hex_lower(&receipt_pubkey_sha256),
+        },
         "evidence": {
             "format": if evidence_json.is_some() { "coco-attestation-report" } else { "opaque" },
             "payload_b64": evidence_payload_b64,
@@ -2090,6 +2320,25 @@ pub async fn teardown(
     }
 }
 
+/// POST /receipts/sign -- sign an in-TEE lifecycle receipt.
+///
+/// This endpoint is ownership-gated by the global middleware, so password-mode
+/// workloads cannot issue lifecycle receipts until storage is unlocked. The
+/// response shape is the Trustee workload-resource request envelope minus the
+/// optional `value` bytes, which the caller supplies on rekey.
+pub async fn sign_receipt(
+    State(state): State<AppState>,
+    Json(request): Json<SignReceiptRequest>,
+) -> Response {
+    match state.receipt_signer.sign(request) {
+        Ok(response) => json_response(
+            200,
+            &serde_json::to_value(response).unwrap_or_else(|_| json!({"error": "encode_failed"})),
+        ),
+        Err(err) => receipt_error_response(err),
+    }
+}
+
 /// Fallback handler for unmatched routes.
 pub async fn not_found(req: axum::extract::Request) -> Response {
     let path = req.uri().path().to_string();
@@ -2116,8 +2365,8 @@ mod tests {
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use axum::body::Bytes;
-    use axum::extract::{Path as AxumPath, State as AxumState};
-    use axum::http::StatusCode;
+    use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::{get, put};
     use axum::Router;
@@ -2162,6 +2411,84 @@ mod tests {
         assert!(!is_optional_sealed_owner_seed_resource_missing(&json!({
             "upstream_status": 401
         })));
+    }
+
+    #[tokio::test]
+    async fn attestation_rejects_caller_supplied_runtime_data() {
+        let signal_dir = test_signal_dir("attestation-runtime-data-rejected");
+        let state = build_state(&signal_dir.path);
+
+        let response = attestation(
+            State(state),
+            Query(AttestationQuery {
+                nonce: Some(BASE64_STANDARD.encode([0x11; 32])),
+                runtime_data: Some(BASE64_STANDARD.encode([0x99; 64])),
+                leaf_spki_sha256: Some("22".repeat(32)),
+                domain: Some("app.example.com".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("runtime_data_rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn attestation_forwards_report_data_with_receipt_pubkey_hash() {
+        let signal_dir = test_signal_dir("attestation-report-data-binding");
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(&signal_dir.path, "level1", api_server.base_url(), None);
+        let nonce = [0x31; 32];
+        let leaf_spki_sha256 = [0x42; 32];
+        let domain = "app.example.com";
+
+        let response = attestation(
+            State(state.clone()),
+            Query(AttestationQuery {
+                nonce: Some(BASE64_STANDARD.encode(nonce)),
+                runtime_data: None,
+                leaf_spki_sha256: Some(test_hex_lower(&leaf_spki_sha256)),
+                domain: Some(domain.to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = api_server.aa_evidence_runtime_data();
+        assert_eq!(captured.len(), 1, "expected one AA evidence request");
+        let forwarded = BASE64_STANDARD
+            .decode(&captured[0])
+            .expect("forwarded runtime_data base64");
+        assert_eq!(forwarded.len(), 64);
+
+        let receipt_pubkey_sha256 = state.receipt_signer.public_key_sha256();
+        let expected = build_report_data(domain, &nonce, &leaf_spki_sha256, &receipt_pubkey_sha256);
+        assert_eq!(forwarded, expected);
+        let expected_transcript = crate::receipts::ce_v1_hash(&[
+            ("purpose", b"enclava-tee-tls-v1"),
+            ("domain", domain.as_bytes()),
+            ("nonce", &nonce),
+            ("leaf_spki_sha256", &leaf_spki_sha256),
+        ]);
+        assert_eq!(&forwarded[..32], expected_transcript.as_slice());
+        assert_eq!(&forwarded[32..64], receipt_pubkey_sha256.as_slice());
+
+        let expected_receipt_hash_hex = test_hex_lower(&receipt_pubkey_sha256);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.pointer("/runtime_data_binding/receipt_pubkey_sha256")
+                .and_then(Value::as_str),
+            Some(expected_receipt_hash_hex.as_str())
+        );
     }
 
     #[tokio::test]
@@ -3295,6 +3622,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kbs_resource_first_write_uses_create_precondition() {
+        let signal_dir = test_signal_dir("kbs-resource-first-write");
+        let encrypted = owner_seed_envelope_json([0x71; 32], "first-password", "instance-test-01");
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        update_owner_seed_material(
+            &state,
+            EscrowValueUpdate::Set(encrypted.as_bytes()),
+            EscrowValueUpdate::Remove,
+        )
+        .await
+        .expect("first write should create encrypted resource");
+
+        assert_eq!(
+            api_server.kbs_resource("default/instance-test-01-owner/seed-encrypted"),
+            Some(encrypted)
+        );
+        assert_eq!(
+            api_server.kbs_resource("default/instance-test-01-owner/seed-sealed"),
+            None,
+            "missing sealed resource should not be deleted during first write"
+        );
+    }
+
     fn build_state(signal_dir: &Path) -> AppState {
         build_state_with_mode(signal_dir, "level1", "http://127.0.0.1:9".to_string(), None)
     }
@@ -3329,6 +3692,7 @@ mod tests {
         config.instance_id = "instance-test-01".to_string();
         config.kbs_resource_url = format!("{base_url}/kbs/v0/resource");
         config.aa_token_url = format!("{base_url}/aa/token");
+        config.aa_evidence_url = format!("{base_url}/aa/evidence");
         config.owner_seed_handoff_slots = owner_seed_handoff_slots;
         config.owner_seed_encrypted_kbs_path = owner_seed_encrypted_kbs_path.unwrap_or_default();
         config.owner_ciphertext_backend = if config.owner_seed_encrypted_kbs_path.is_empty() {
@@ -3352,6 +3716,8 @@ mod tests {
                 signal_dir.to_path_buf(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
         }
     }
 
@@ -3376,6 +3742,7 @@ mod tests {
         config.k8s_api_url = base_url.clone();
         config.k8s_service_account_token_path = token_path.display().to_string();
         config.aa_token_url = format!("{base_url}/aa/token");
+        config.aa_evidence_url = format!("{base_url}/aa/evidence");
         config.kbs_resource_url = format!("{base_url}/kbs/v0/resource");
 
         AppState {
@@ -3388,6 +3755,8 @@ mod tests {
                 signal_dir.to_path_buf(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
         }
     }
 
@@ -3449,6 +3818,7 @@ mod tests {
     #[derive(Clone)]
     struct TestApiState {
         aa_token_response: Value,
+        aa_evidence_runtime_data: Arc<Mutex<Vec<String>>>,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
         cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
@@ -3458,6 +3828,7 @@ mod tests {
     struct TestApiServer {
         addr: SocketAddr,
         task: tokio::task::JoinHandle<()>,
+        aa_evidence_runtime_data: Arc<Mutex<Vec<String>>>,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
     }
@@ -3480,6 +3851,13 @@ mod tests {
                 .expect("kbs resource lock poisoned")
                 .get(path)
                 .cloned()
+        }
+
+        fn aa_evidence_runtime_data(&self) -> Vec<String> {
+            self.aa_evidence_runtime_data
+                .lock()
+                .expect("aa evidence runtime data lock poisoned")
+                .clone()
         }
     }
 
@@ -3558,11 +3936,125 @@ mod tests {
         }
     }
 
+    fn assert_header_value(headers: &HeaderMap, name: &str, expected: &str) {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some(expected),
+            "expected {name}: {expected}"
+        );
+    }
+
+    fn assert_header_absent(headers: &HeaderMap, name: &str) {
+        assert!(headers.get(name).is_none(), "did not expect {name} header");
+    }
+
+    fn test_hex_lower(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn assert_workload_receipt_envelope(
+        body: Bytes,
+        operation: &str,
+        resource_path: &str,
+        expected_value: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let envelope: Value = serde_json::from_slice(&body).expect("workload receipt json");
+        assert_eq!(
+            envelope.get("operation").and_then(Value::as_str),
+            Some(operation)
+        );
+        let expected_purpose = match operation {
+            "rekey" => "enclava-rekey-v1",
+            "teardown" => "enclava-teardown-v1",
+            other => panic!("unexpected operation {other}"),
+        };
+        assert_eq!(
+            envelope.pointer("/payload/purpose").and_then(Value::as_str),
+            Some(expected_purpose)
+        );
+        assert_eq!(
+            envelope.pointer("/payload/app_id").and_then(Value::as_str),
+            Some("instance-test-01")
+        );
+        assert_eq!(
+            envelope
+                .pointer("/payload/resource_path")
+                .and_then(Value::as_str),
+            Some(resource_path)
+        );
+        assert!(
+            envelope
+                .pointer("/receipt/pubkey")
+                .and_then(Value::as_str)
+                .is_some(),
+            "receipt pubkey should be present"
+        );
+        assert!(
+            envelope
+                .pointer("/receipt/signature")
+                .and_then(Value::as_str)
+                .is_some(),
+            "receipt signature should be present"
+        );
+        if operation == "teardown" {
+            assert!(
+                envelope.get("value").is_none(),
+                "teardown envelope should not include value"
+            );
+        }
+
+        envelope
+            .get("value")
+            .and_then(Value::as_str)
+            .map(|encoded| {
+                let decoded = BASE64_STANDARD
+                    .decode(encoded)
+                    .expect("base64 workload value");
+                if let Some(expected) = expected_value {
+                    assert_eq!(decoded, expected);
+                }
+                assert_eq!(
+                    envelope
+                        .pointer("/payload/new_value_sha256")
+                        .and_then(Value::as_str),
+                    Some(test_hex_lower(&sha2::Sha256::digest(&decoded)).as_str())
+                );
+                decoded
+            })
+    }
+
     async fn put_workload_kbs_resource(
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
+        headers: HeaderMap,
         body: Bytes,
     ) -> impl IntoResponse {
+        let is_create = headers.get("if-none-match").is_some();
+        let body = if is_create {
+            assert_header_value(&headers, "if-none-match", "*");
+            assert_header_absent(&headers, "if-match");
+            body.to_vec()
+        } else {
+            assert_header_value(&headers, "if-match", "*");
+            assert_header_absent(&headers, "if-none-match");
+            assert_workload_receipt_envelope(body, "rekey", &path, None).expect("rekey value")
+        };
+        let resource_exists = state
+            .kbs_resources
+            .lock()
+            .expect("kbs resource lock poisoned")
+            .contains_key(&path);
+        assert_ne!(
+            is_create, resource_exists,
+            "workload PUT precondition should match resource existence"
+        );
+
         let sequence_key = format!("PUT {path}");
         if let Some(status) = state
             .workload_resource_status_sequences
@@ -3584,7 +4076,7 @@ mod tests {
                 .into_response();
         }
 
-        let body = String::from_utf8(body.to_vec()).expect("utf-8 workload body");
+        let body = String::from_utf8(body).expect("utf-8 workload body");
         state
             .kbs_resources
             .lock()
@@ -3596,7 +4088,13 @@ mod tests {
     async fn delete_workload_kbs_resource(
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
+        headers: HeaderMap,
+        body: Bytes,
     ) -> impl IntoResponse {
+        assert_header_value(&headers, "if-match", "*");
+        assert_header_absent(&headers, "if-none-match");
+        assert_workload_receipt_envelope(body, "teardown", &path, None);
+
         let sequence_key = format!("DELETE {path}");
         if let Some(status) = state
             .workload_resource_status_sequences
@@ -3628,6 +4126,24 @@ mod tests {
 
     async fn test_aa_token_handler(AxumState(state): AxumState<TestApiState>) -> Json<Value> {
         Json(state.aa_token_response.clone())
+    }
+
+    async fn test_aa_evidence_handler(
+        AxumState(state): AxumState<TestApiState>,
+        AxumQuery(query): AxumQuery<HashMap<String, String>>,
+    ) -> Json<Value> {
+        if let Some(runtime_data) = query.get("runtime_data") {
+            state
+                .aa_evidence_runtime_data
+                .lock()
+                .expect("aa evidence runtime data lock poisoned")
+                .push(runtime_data.clone());
+        }
+        Json(json!({
+            "ear.veraison.annotated-evidence": {
+                "runtime_data": query.get("runtime_data").cloned().unwrap_or_default()
+            }
+        }))
     }
 
     async fn spawn_test_api_server(
@@ -3664,8 +4180,10 @@ mod tests {
     ) -> TestApiServer {
         let owner_secret = Arc::new(Mutex::new(owner_secret));
         let kbs_resources = Arc::new(Mutex::new(kbs_resources));
+        let aa_evidence_runtime_data = Arc::new(Mutex::new(Vec::new()));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
+            aa_evidence_runtime_data: aa_evidence_runtime_data.clone(),
             owner_secret: owner_secret.clone(),
             kbs_resources: kbs_resources.clone(),
             cdh_status_sequences: Arc::new(Mutex::new(cdh_status_sequences)),
@@ -3685,6 +4203,7 @@ mod tests {
                 put(put_workload_kbs_resource).delete(delete_workload_kbs_resource),
             )
             .route("/aa/token", get(test_aa_token_handler))
+            .route("/aa/evidence", get(test_aa_evidence_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3698,6 +4217,7 @@ mod tests {
         TestApiServer {
             addr,
             task,
+            aa_evidence_runtime_data,
             owner_secret,
             kbs_resources,
         }
@@ -3928,6 +4448,8 @@ mod tests {
                 signal_dir.path.clone(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
         };
         // Unlock so ownership gate does not interfere
         state.ownership.set_unlocked();
@@ -4075,6 +4597,8 @@ mod tests {
                 signal_dir.path.clone(),
             )),
             bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
         };
 
         // Status should include config_ready = false (no sentinel yet)

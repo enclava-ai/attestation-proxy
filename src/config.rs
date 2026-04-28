@@ -5,6 +5,8 @@
 pub struct Config {
     pub listen_host: String,
     pub listen_port: u16,
+    pub listen_tls_port: u16,
+    pub tee_domain: String,
     pub aa_evidence_url: String,
     pub aa_token_url: String,
     pub aa_token_timeout_seconds: f64,
@@ -96,6 +98,10 @@ impl Config {
         Self {
             listen_host: env_or("ATTESTATION_BIND", "0.0.0.0"),
             listen_port: env_or("ATTESTATION_PORT", "8081").parse().unwrap_or(8081),
+            listen_tls_port: env_or("ATTESTATION_TLS_PORT", "8443")
+                .parse()
+                .unwrap_or(8443),
+            tee_domain: env_or("TEE_DOMAIN", "localhost"),
             aa_evidence_url: env_or("AA_EVIDENCE_URL", "http://127.0.0.1:8006/aa/evidence"),
             aa_token_url: env_or(
                 "AA_TOKEN_URL",
@@ -182,6 +188,8 @@ impl Config {
         Self {
             listen_host: "0.0.0.0".into(),
             listen_port: 8081,
+            listen_tls_port: 8443,
+            tee_domain: "localhost".into(),
             aa_evidence_url: "http://127.0.0.1:8006/aa/evidence".into(),
             aa_token_url: "http://127.0.0.1:8006/aa/token?token_type=kbs".into(),
             aa_token_timeout_seconds: 10.0,
@@ -242,6 +250,8 @@ mod tests {
     const ALL_ENV_VARS: &[&str] = &[
         "ATTESTATION_BIND",
         "ATTESTATION_PORT",
+        "ATTESTATION_TLS_PORT",
+        "TEE_DOMAIN",
         "AA_EVIDENCE_URL",
         "AA_TOKEN_URL",
         "AA_TOKEN_TIMEOUT_SECONDS",
@@ -290,6 +300,8 @@ mod tests {
 
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 8081);
+        assert_eq!(config.listen_tls_port, 8443);
+        assert_eq!(config.tee_domain, "localhost");
         assert_eq!(config.aa_evidence_url, "http://127.0.0.1:8006/aa/evidence");
         assert_eq!(
             config.aa_token_url,

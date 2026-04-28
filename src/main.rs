@@ -2,6 +2,7 @@ use attestation_proxy::attestation::AaTokenCache;
 use attestation_proxy::config::Config;
 use attestation_proxy::handlers;
 use attestation_proxy::ownership::OwnershipGuard;
+use attestation_proxy::receipts::ReceiptSigner;
 use attestation_proxy::AppState;
 use axum::body::Body;
 use axum::extract::State;
@@ -10,9 +11,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
+use rcgen::generate_simple_self_signed;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
+use x509_cert::der::{Decode, Encode};
 
 /// Ownership gate middleware: blocks non-allowed paths with 423 in level1 mode.
 async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
@@ -37,8 +42,13 @@ async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next:
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Config::from_env();
-    let addr = format!("{}:{}", config.listen_host, config.listen_port);
+    let http_addr = format!("{}:{}", config.listen_host, config.listen_port);
+    let tls_addr = format!("{}:{}", config.listen_host, config.listen_tls_port);
+    let tls_domain = config.tee_domain.clone();
+    let tls_material =
+        generate_tls_material(&tls_domain).expect("failed to generate attestation TLS cert");
 
     let state = AppState {
         ownership: Arc::new(OwnershipGuard::new(config.storage_ownership_mode.clone())),
@@ -47,6 +57,8 @@ async fn main() {
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
         bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
+        receipt_signer: Arc::new(ReceiptSigner::ephemeral()),
+        tls_leaf_spki_sha256: tls_material.spki_sha256,
     };
 
     handlers::initialize_ownership_state(&state).await;
@@ -61,7 +73,32 @@ async fn main() {
         }
     }
 
-    let app = Router::new()
+    let http_app = app_router(state.clone());
+    let tls_app = app_router(state);
+    let http_listener = tokio::net::TcpListener::bind(&http_addr)
+        .await
+        .expect("failed to bind attestation HTTP listener");
+    let tls_config = RustlsConfig::from_der(vec![tls_material.cert_der], tls_material.key_der)
+        .await
+        .expect("failed to build attestation TLS config");
+
+    println!("attestation-proxy HTTP listening on {http_addr}");
+    println!("attestation-proxy TLS listening on {tls_addr}");
+
+    let tls_socket_addr: std::net::SocketAddr = tls_addr.parse().unwrap();
+    tokio::select! {
+        result = axum::serve(http_listener, http_app.into_make_service()) => {
+            result.expect("attestation HTTP server failed");
+        }
+        result = axum_server::bind_rustls(tls_socket_addr, tls_config)
+            .serve(tls_app.into_make_service()) => {
+            result.expect("attestation TLS server failed");
+        }
+    }
+}
+
+fn app_router(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(handlers::health))
         .route("/status", get(handlers::status))
         .route("/.well-known/confidential/status", get(handlers::status))
@@ -119,16 +156,37 @@ async fn main() {
             post(handlers::teardown),
         )
         .route("/teardown", post(handlers::teardown))
+        .route("/receipts/sign", post(handlers::sign_receipt))
+        .route(
+            "/.well-known/confidential/receipts/sign",
+            post(handlers::sign_receipt),
+        )
         .fallback(handlers::not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ownership_gate,
         ))
-        .with_state(state);
+        .with_state(state)
+}
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    println!("attestation-proxy listening on {addr}");
-    axum::serve(listener, app).await.unwrap();
+struct TlsMaterial {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    spki_sha256: [u8; 32],
+}
+
+fn generate_tls_material(domain: &str) -> Result<TlsMaterial, Box<dyn std::error::Error>> {
+    let subject_alt_names = vec![domain.to_string(), "localhost".to_string()];
+    let certified = generate_simple_self_signed(subject_alt_names)?;
+    let cert_der = certified.cert.der().to_vec();
+    let cert = x509_cert::Certificate::from_der(&cert_der)?;
+    let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
+    let spki_sha256 = Sha256::digest(spki_der).into();
+    Ok(TlsMaterial {
+        cert_der,
+        key_der: certified.signing_key.serialize_der(),
+        spki_sha256,
+    })
 }
 
 #[cfg(test)]

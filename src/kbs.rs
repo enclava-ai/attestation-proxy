@@ -5,11 +5,15 @@
 /// caller receives plaintext resource bytes rather than KBS-wrapped ciphertext.
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::attestation::fetch_kbs_bearer_token;
 use crate::ownership::{utc_now, OwnershipError};
+use crate::receipts::{ReceiptType, SignReceiptRequest};
 
 pub struct KbsCacheEntry {
     pub body: Vec<u8>,
@@ -294,12 +298,57 @@ fn workload_resource_base(kbs_resource_url: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadResourceWriteMode {
+    Create,
+    Replace,
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sign_workload_receipt(
+    state: &crate::AppState,
+    receipt_type: ReceiptType,
+    resource_path: &str,
+    value: Option<&[u8]>,
+) -> Result<Value, OwnershipError> {
+    let new_value_sha256 = value.map(|bytes| hex_lower(&Sha256::digest(bytes)));
+    let response = state
+        .receipt_signer
+        .sign(SignReceiptRequest {
+            receipt_type,
+            app_id: state.config.instance_id.clone(),
+            resource_path: Some(resource_path.to_string()),
+            from_mode: None,
+            to_mode: None,
+            attestation_quote_sha256: None,
+            new_value_sha256,
+            timestamp: None,
+        })
+        .map_err(|err| OwnershipError::Store(format!("receipt_sign_failed:{err}")))?;
+    let mut envelope = serde_json::to_value(response)
+        .map_err(|err| OwnershipError::Store(format!("receipt_encode_failed:{err}")))?;
+    if let Some(bytes) = value {
+        envelope["value"] = json!(BASE64_STANDARD.encode(bytes));
+    }
+    Ok(envelope)
+}
+
 /// Write ciphertext to KBS via the workload-resource endpoint.
 /// Uses PUT /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
 pub async fn put_kbs_workload_resource(
     state: &crate::AppState,
     resource_path: &str,
     body: &[u8],
+    mode: WorkloadResourceWriteMode,
 ) -> Result<(), OwnershipError> {
     let token = fetch_kbs_bearer_token(state)
         .await
@@ -310,13 +359,24 @@ pub async fn put_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    let response = state
+    let request = state
         .http_client
         .put(&workload_url)
         .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/octet-stream")
-        .timeout(std::time::Duration::from_secs(20))
-        .body(body.to_vec())
+        .timeout(std::time::Duration::from_secs(20));
+    let request = match mode {
+        WorkloadResourceWriteMode::Create => request
+            .header("If-None-Match", "*")
+            .header("Content-Type", "application/octet-stream")
+            .body(body.to_vec()),
+        WorkloadResourceWriteMode::Replace => {
+            let envelope =
+                sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
+            request.header("If-Match", "*").json(&envelope)
+        }
+    };
+
+    let response = request
         .send()
         .await
         .map_err(|e| OwnershipError::Store(format!("kbs_workload_put_failed:{e}")))?;
@@ -348,10 +408,14 @@ pub async fn delete_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
+    let envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
+
     let response = state
         .http_client
         .delete(&workload_url)
         .header("Authorization", format!("Bearer {token}"))
+        .header("If-Match", "*")
+        .json(&envelope)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
@@ -518,6 +582,8 @@ mod tests {
             bootstrap_challenges: Arc::new(
                 std::sync::Mutex::new(std::collections::VecDeque::new()),
             ),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0u8; 32],
         };
 
         // Verify entry exists before eviction

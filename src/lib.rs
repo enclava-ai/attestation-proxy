@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod jwt;
 pub mod kbs;
 pub mod ownership;
+pub mod receipts;
 pub mod sev;
 
 use std::collections::{HashMap, VecDeque};
@@ -17,6 +18,7 @@ use attestation::AaTokenCache;
 use config::Config;
 use kbs::KbsCacheEntry;
 use ownership::{BootstrapChallenge, OwnershipGuard};
+use receipts::ReceiptSigner;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,4 +28,6 @@ pub struct AppState {
     pub kbs_resource_cache: Arc<RwLock<HashMap<String, KbsCacheEntry>>>,
     pub ownership: Arc<OwnershipGuard>,
     pub bootstrap_challenges: Arc<Mutex<VecDeque<BootstrapChallenge>>>,
+    pub receipt_signer: Arc<ReceiptSigner>,
+    pub tls_leaf_spki_sha256: [u8; 32],
 }
