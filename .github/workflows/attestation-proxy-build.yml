@@ -2,14 +2,17 @@ name: Build Attestation Proxy
 
 on:
   push:
+    branches: ["main"]
     tags:
       - "v*"
+  workflow_dispatch:
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: write
     env:
       MUSL_TARGET: x86_64-unknown-linux-musl
@@ -49,6 +52,7 @@ jobs:
           fi
 
       - name: Push image to GHCR
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,3 +62,13 @@ jobs:
           tags: ghcr.io/enclava-ai/attestation-proxy:v2
           build-args: |
             MUSL_TARGET=${{ env.MUSL_TARGET }}
+          provenance: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign pushed digest
+        env:
+          IMAGE: ghcr.io/enclava-ai/attestation-proxy
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
