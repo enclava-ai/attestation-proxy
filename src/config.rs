@@ -4,6 +4,7 @@
 /// with ownership-mode additions for the Rust implementation.
 pub struct Config {
     pub listen_host: String,
+    pub listen_tls_host: String,
     pub listen_port: u16,
     pub listen_tls_port: u16,
     pub tee_domain: String,
@@ -16,6 +17,8 @@ pub struct Config {
     pub aa_token_fetch_attempts: u32,
     pub aa_token_fetch_retry_sleep_seconds: f64,
     pub kbs_resource_url: String,
+    pub kbs_resource_ca_cert_pem: String,
+    pub kbs_resource_ca_cert_path: String,
     pub kbs_resource_cache_seconds: f64,
     pub kbs_resource_failure_cache_seconds: f64,
     pub attestation_profile: String,
@@ -99,7 +102,8 @@ impl Config {
         }
 
         Self {
-            listen_host: env_or("ATTESTATION_BIND", "0.0.0.0"),
+            listen_host: env_or("ATTESTATION_BIND", "127.0.0.1"),
+            listen_tls_host: env_or("ATTESTATION_TLS_BIND", "0.0.0.0"),
             listen_port: env_or("ATTESTATION_PORT", "8081").parse().unwrap_or(8081),
             listen_tls_port: env_or("ATTESTATION_TLS_PORT", "8443")
                 .parse()
@@ -120,6 +124,8 @@ impl Config {
                 "KBS_RESOURCE_URL",
                 "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource",
             ),
+            kbs_resource_ca_cert_pem: env_or("KBS_RESOURCE_CA_CERT_PEM", "").replace("\\n", "\n"),
+            kbs_resource_ca_cert_path: env_or("KBS_RESOURCE_CA_CERT_PATH", ""),
             kbs_resource_cache_seconds: env_f64("KBS_RESOURCE_CACHE_SECONDS", 300.0),
             kbs_resource_failure_cache_seconds: env_f64("KBS_RESOURCE_FAILURE_CACHE_SECONDS", 30.0),
             attestation_profile: env_or("ATTESTATION_PROFILE", "coco-sev-snp"),
@@ -192,7 +198,8 @@ impl Config {
     #[cfg(test)]
     pub fn from_env_for_test() -> Self {
         Self {
-            listen_host: "0.0.0.0".into(),
+            listen_host: "127.0.0.1".into(),
+            listen_tls_host: "0.0.0.0".into(),
             listen_port: 8081,
             listen_tls_port: 8443,
             tee_domain: "localhost".into(),
@@ -207,6 +214,8 @@ impl Config {
             kbs_resource_url:
                 "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
                     .into(),
+            kbs_resource_ca_cert_pem: "".into(),
+            kbs_resource_ca_cert_path: "".into(),
             kbs_resource_cache_seconds: 300.0,
             kbs_resource_failure_cache_seconds: 30.0,
             attestation_profile: "coco-sev-snp".into(),
@@ -258,6 +267,7 @@ mod tests {
     /// All env var names that Config reads, for cleanup between tests.
     const ALL_ENV_VARS: &[&str] = &[
         "ATTESTATION_BIND",
+        "ATTESTATION_TLS_BIND",
         "ATTESTATION_PORT",
         "ATTESTATION_TLS_PORT",
         "TEE_DOMAIN",
@@ -270,6 +280,8 @@ mod tests {
         "AA_TOKEN_FETCH_ATTEMPTS",
         "AA_TOKEN_FETCH_RETRY_SLEEP_SECONDS",
         "KBS_RESOURCE_URL",
+        "KBS_RESOURCE_CA_CERT_PEM",
+        "KBS_RESOURCE_CA_CERT_PATH",
         "KBS_RESOURCE_CACHE_SECONDS",
         "KBS_RESOURCE_FAILURE_CACHE_SECONDS",
         "ATTESTATION_PROFILE",
@@ -310,7 +322,8 @@ mod tests {
 
         let config = Config::from_env();
 
-        assert_eq!(config.listen_host, "0.0.0.0");
+        assert_eq!(config.listen_host, "127.0.0.1");
+        assert_eq!(config.listen_tls_host, "0.0.0.0");
         assert_eq!(config.listen_port, 8081);
         assert_eq!(config.listen_tls_port, 8443);
         assert_eq!(config.tee_domain, "localhost");
@@ -329,6 +342,8 @@ mod tests {
             config.kbs_resource_url,
             "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
         );
+        assert_eq!(config.kbs_resource_ca_cert_pem, "");
+        assert_eq!(config.kbs_resource_ca_cert_path, "");
         assert_eq!(config.kbs_resource_cache_seconds, 300.0);
         assert_eq!(config.kbs_resource_failure_cache_seconds, 30.0);
         assert_eq!(config.attestation_profile, "coco-sev-snp");
@@ -431,6 +446,33 @@ mod tests {
         assert_eq!(config.cap_api_signing_pubkey, "dGVzdC1rZXk");
         assert_eq!(config.cap_api_url, "https://api.enclava.dev");
         assert_eq!(config.cap_config_dir, "/custom/config");
+    }
+
+    #[test]
+    fn test_kbs_resource_tls_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var(
+            "KBS_RESOURCE_URL",
+            "https://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource",
+        );
+        std::env::set_var(
+            "KBS_RESOURCE_CA_CERT_PEM",
+            "-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----",
+        );
+        std::env::set_var("KBS_RESOURCE_CA_CERT_PATH", "/etc/kbs-https/ca-cert.pem");
+        let config = Config::from_env();
+
+        assert_eq!(
+            config.kbs_resource_url,
+            "https://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
+        );
+        assert!(config.kbs_resource_ca_cert_pem.contains('\n'));
+        assert_eq!(
+            config.kbs_resource_ca_cert_path,
+            "/etc/kbs-https/ca-cert.pem"
+        );
     }
 
     #[test]

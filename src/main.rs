@@ -15,6 +15,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use x509_cert::der::{Decode, Encode};
@@ -45,15 +46,16 @@ async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Config::from_env();
     let http_addr = format!("{}:{}", config.listen_host, config.listen_port);
-    let tls_addr = format!("{}:{}", config.listen_host, config.listen_tls_port);
+    let tls_addr = format!("{}:{}", config.listen_tls_host, config.listen_tls_port);
     let tls_domain = config.tee_domain.clone();
     let tls_material =
         generate_tls_material(&tls_domain).expect("failed to generate attestation TLS cert");
+    let http_client = build_http_client(&config).expect("failed to build attestation HTTP client");
 
     let state = AppState {
         ownership: Arc::new(OwnershipGuard::new(config.storage_ownership_mode.clone())),
         config: Arc::new(config),
-        http_client: reqwest::Client::new(),
+        http_client,
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
         bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
@@ -95,6 +97,23 @@ async fn main() {
             result.expect("attestation TLS server failed");
         }
     }
+}
+
+fn build_http_client(config: &Config) -> Result<reqwest::Client, Box<dyn Error + Send + Sync>> {
+    let mut builder = reqwest::Client::builder();
+
+    if !config.kbs_resource_ca_cert_pem.trim().is_empty() {
+        let cert = reqwest::Certificate::from_pem(config.kbs_resource_ca_cert_pem.as_bytes())?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    if !config.kbs_resource_ca_cert_path.trim().is_empty() {
+        let pem = std::fs::read(&config.kbs_resource_ca_cert_path)?;
+        let cert = reqwest::Certificate::from_pem(&pem)?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    Ok(builder.build()?)
 }
 
 fn app_router(state: AppState) -> Router {

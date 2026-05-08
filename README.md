@@ -73,7 +73,13 @@ Run locally:
 cargo run
 ```
 
-By default the server listens on `0.0.0.0:8081`.
+By default the internal HTTP server listens on `127.0.0.1:8081`; the attested
+TLS listener binds `0.0.0.0:8443`. Override them separately with
+`ATTESTATION_BIND` and `ATTESTATION_TLS_BIND`.
+
+When Trustee KBS is exposed over an internal CA, set `KBS_RESOURCE_URL` to the
+HTTPS `/kbs/v0/resource` endpoint and provide either `KBS_RESOURCE_CA_CERT_PEM`
+or `KBS_RESOURCE_CA_CERT_PATH`.
 
 ## Container image
 
