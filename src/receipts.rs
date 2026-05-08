@@ -226,6 +226,15 @@ impl ReceiptSigner {
                 app_id.as_bytes().to_vec()
             };
 
+        let new_value_sha256_bytes = new_value_sha256
+            .as_deref()
+            .map(decode_sha256_hex)
+            .transpose()?;
+        let attestation_quote_sha256_bytes = attestation_quote_sha256
+            .as_deref()
+            .map(decode_sha256_hex)
+            .transpose()?;
+
         let mut records: Vec<(&str, &[u8])> = vec![
             ("purpose", purpose.as_bytes()),
             ("app_id", app_id_record_bytes.as_slice()),
@@ -239,11 +248,11 @@ impl ReceiptSigner {
         if let Some(ref mode) = to_mode {
             records.push(("to_mode", mode.as_bytes()));
         }
-        if let Some(ref hash) = new_value_sha256 {
-            records.push(("new_value_sha256", hash.as_bytes()));
+        if let Some(ref hash) = new_value_sha256_bytes {
+            records.push(("new_value_sha256", hash.as_slice()));
         }
-        if let Some(ref hash) = attestation_quote_sha256 {
-            records.push(("attestation_quote_sha256", hash.as_bytes()));
+        if let Some(ref hash) = attestation_quote_sha256_bytes {
+            records.push(("attestation_quote_sha256", hash.as_slice()));
         }
         records.push(("timestamp", timestamp.as_bytes()));
 
@@ -337,6 +346,30 @@ fn validate_sha256_hex(value: &str) -> Result<String, ReceiptError> {
     }
 }
 
+fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ReceiptError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err(ReceiptError::NewValueHashInvalid);
+    }
+
+    let mut out = [0u8; 32];
+    for idx in 0..32 {
+        let hi = hex_nibble(bytes[idx * 2]).ok_or(ReceiptError::NewValueHashInvalid)?;
+        let lo = hex_nibble(bytes[idx * 2 + 1]).ok_or(ReceiptError::NewValueHashInvalid)?;
+        out[idx] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(crate) fn ce_v1_bytes(records: &[(&str, &[u8])]) -> Vec<u8> {
     let total: usize = records
         .iter()
@@ -405,6 +438,7 @@ mod tests {
             .verify(&payload, &signature)
             .expect("verify signature");
 
+        let new_value_hash = decode_sha256_hex(&"ab".repeat(32)).expect("hash hex");
         let expected = ce_v1_bytes(&[
             ("purpose", b"enclava-rekey-v1"),
             ("app_id", b"app-123"),
@@ -412,7 +446,7 @@ mod tests {
                 "resource_path",
                 b"default/app-123-owner/workload-secret-seed",
             ),
-            ("new_value_sha256", "ab".repeat(32).as_bytes()),
+            ("new_value_sha256", new_value_hash.as_slice()),
             ("timestamp", b"2026-04-28T08:00:00Z"),
         ]);
         assert_eq!(payload, expected);
@@ -463,14 +497,14 @@ mod tests {
         let payload = STANDARD
             .decode(response.receipt.payload_canonical_bytes)
             .expect("decode payload");
-        let quote_hash = "cd".repeat(32);
+        let quote_hash = decode_sha256_hex(&"cd".repeat(32)).expect("quote hash hex");
         let app_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let expected = ce_v1_bytes(&[
             ("purpose", b"enclava-unlock-receipt-v1"),
             ("app_id", app_id.as_bytes()),
             ("from_mode", b"password"),
             ("to_mode", b"auto"),
-            ("attestation_quote_sha256", quote_hash.as_bytes()),
+            ("attestation_quote_sha256", quote_hash.as_slice()),
             ("timestamp", b"2026-04-28T08:00:00Z"),
         ]);
         assert_eq!(payload, expected);
