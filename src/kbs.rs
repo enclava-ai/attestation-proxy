@@ -365,10 +365,11 @@ pub async fn put_kbs_workload_resource(
         .header("Authorization", format!("Bearer {token}"))
         .timeout(std::time::Duration::from_secs(20));
     let request = match mode {
-        WorkloadResourceWriteMode::Create => request
-            .header("If-None-Match", "*")
-            .header("Content-Type", "application/octet-stream")
-            .body(body.to_vec()),
+        WorkloadResourceWriteMode::Create => {
+            let envelope =
+                sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
+            request.header("If-None-Match", "*").json(&envelope)
+        }
         WorkloadResourceWriteMode::Replace => {
             let envelope =
                 sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;

@@ -4039,7 +4039,7 @@ mod tests {
         let body = if is_create {
             assert_header_value(&headers, "if-none-match", "*");
             assert_header_absent(&headers, "if-match");
-            body.to_vec()
+            assert_workload_receipt_envelope(body, "rekey", &path, None).expect("create value")
         } else {
             assert_header_value(&headers, "if-match", "*");
             assert_header_absent(&headers, "if-none-match");
