@@ -174,9 +174,14 @@ fn build_report_data(
     receipt_pubkey_sha256: &[u8; 32],
 ) -> [u8; 64] {
     let transcript_hash = tee_tls_transcript_hash(domain, nonce, leaf_spki_sha256);
+    let binding_hash = crate::receipts::ce_v1_hash(&[
+        ("purpose", b"enclava-tee-report-data-v1"),
+        ("transcript_hash", &transcript_hash),
+        ("receipt_pubkey_sha256", receipt_pubkey_sha256),
+    ]);
+    let binding_hex = hex_lower(&binding_hash);
     let mut report_data = [0u8; 64];
-    report_data[..32].copy_from_slice(&transcript_hash);
-    report_data[32..64].copy_from_slice(receipt_pubkey_sha256);
+    report_data.copy_from_slice(binding_hex.as_bytes());
     report_data
 }
 
@@ -966,14 +971,10 @@ pub async fn attestation(
         &leaf_spki_sha256,
         &receipt_pubkey_sha256,
     );
-    let aa_runtime_data = STANDARD.encode(report_data);
-
     // Fetch evidence from AA agent
-    let encoded_runtime_data = percent_encoding::percent_encode(
-        aa_runtime_data.as_bytes(),
-        percent_encoding::NON_ALPHANUMERIC,
-    )
-    .to_string();
+    let encoded_runtime_data =
+        percent_encoding::percent_encode(&report_data, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
     let evidence_url = format!(
         "{}?runtime_data={}",
         state.config.aa_evidence_url, encoded_runtime_data
@@ -2465,22 +2466,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let captured = api_server.aa_evidence_runtime_data();
         assert_eq!(captured.len(), 1, "expected one AA evidence request");
-        let forwarded = BASE64_STANDARD
-            .decode(&captured[0])
-            .expect("forwarded runtime_data base64");
+        let forwarded = captured[0].as_bytes();
         assert_eq!(forwarded.len(), 64);
+        assert!(forwarded.iter().all(u8::is_ascii_hexdigit));
 
         let receipt_pubkey_sha256 = state.receipt_signer.public_key_sha256();
         let expected = build_report_data(domain, &nonce, &leaf_spki_sha256, &receipt_pubkey_sha256);
-        assert_eq!(forwarded, expected);
+        assert_eq!(forwarded, expected.as_slice());
         let expected_transcript = crate::receipts::ce_v1_hash(&[
             ("purpose", b"enclava-tee-tls-v1"),
             ("domain", domain.as_bytes()),
             ("nonce", &nonce),
             ("leaf_spki_sha256", &leaf_spki_sha256),
         ]);
-        assert_eq!(&forwarded[..32], expected_transcript.as_slice());
-        assert_eq!(&forwarded[32..64], receipt_pubkey_sha256.as_slice());
+        let expected_binding = crate::receipts::ce_v1_hash(&[
+            ("purpose", b"enclava-tee-report-data-v1"),
+            ("transcript_hash", &expected_transcript),
+            ("receipt_pubkey_sha256", &receipt_pubkey_sha256),
+        ]);
+        assert_eq!(forwarded, test_hex_lower(&expected_binding).as_bytes());
 
         let expected_receipt_hash_hex = test_hex_lower(&receipt_pubkey_sha256);
         let body = read_json(response).await;
