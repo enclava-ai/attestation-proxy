@@ -15,6 +15,7 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use zeroize::Zeroizing;
 
 use crate::attestation;
@@ -1522,6 +1523,10 @@ async fn unlock_owner_seed_material(
     state: &AppState,
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
+    if !state.config.enclava_init_unlock_socket.trim().is_empty() {
+        return unlock_owner_seed_via_init_socket(state, owner_seed).await;
+    }
+
     let slots = owner_seed_handoff_slots(state);
     let owner_keys = Zeroizing::new(state.ownership.derive_owner_volume_keys(owner_seed)?);
     state
@@ -1531,6 +1536,69 @@ async fn unlock_owner_seed_material(
         .ownership
         .poll_password_handoff_result_for_slots(&slots, unlock_poll_timeout_seconds())?;
     render_password_handoff_outcome(state, outcome, owner_seed).await
+}
+
+async fn unlock_owner_seed_via_init_socket(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
+    let path = state.config.enclava_init_unlock_socket.trim();
+    let mut stream = connect_init_unlock_socket(path, timeout).await?;
+    let request = format!("owner-seed-v1:{}\n", URL_SAFE_NO_PAD.encode(owner_seed));
+    stream.write_all(request.as_bytes()).await.map_err(|err| {
+        OwnershipError::Store(format!("enclava_init_unlock_socket_write_failed:{err}"))
+    })?;
+
+    let mut reader = TokioBufReader::new(stream);
+    let mut reply = String::new();
+    let read = tokio::time::timeout(timeout, reader.read_line(&mut reply))
+        .await
+        .map_err(|_| OwnershipError::Timeout)?
+        .map_err(|err| {
+            OwnershipError::Store(format!("enclava_init_unlock_socket_read_failed:{err}"))
+        })?;
+    if read == 0 {
+        return Err(OwnershipError::Store(
+            "enclava_init_unlock_socket_closed".to_string(),
+        ));
+    }
+
+    let reply = reply.trim_end_matches(['\r', '\n']);
+    if reply == "OK" {
+        state.ownership.set_unlocked();
+        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+    }
+    if let Some(reason) = reply.strip_prefix("ERR ") {
+        return Err(OwnershipError::Store(format!(
+            "enclava_init_unlock_failed:{reason}"
+        )));
+    }
+    Err(OwnershipError::Store(format!(
+        "enclava_init_unlock_unexpected_reply:{reply}"
+    )))
+}
+
+async fn connect_init_unlock_socket(
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<tokio::net::UnixStream, OwnershipError> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let err = match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => err,
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(OwnershipError::Store(format!(
+                "enclava_init_unlock_socket_connect_failed:{err}"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50).min(deadline - now)).await;
+    }
 }
 
 async fn finalize_rewrapped_owner_seed(
@@ -2932,6 +3000,61 @@ mod tests {
                 .join(SIGNAL_KEY_FILE)
                 .exists(),
             "tls-data key file should not be written when CAP owns TLS via a separate seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_password_mode_uses_enclava_init_socket_when_configured() {
+        let signal_dir = test_signal_dir("unlock-password-init-socket");
+        let owner_seed = [0x25; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            line
+        });
+
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        Arc::get_mut(&mut state.config)
+            .expect("unique config arc")
+            .enclava_init_unlock_socket = socket_path.display().to_string();
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("correct-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        let request_line = socket_task.await.expect("socket task");
+        assert_eq!(
+            request_line.trim_end(),
+            format!(
+                "owner-seed-v1:{}",
+                BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+            )
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "init-socket mode must not write old app-data handoff files"
         );
     }
 

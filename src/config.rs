@@ -37,6 +37,7 @@ pub struct Config {
     pub owner_seed_encrypted_kbs_path: String,
     pub owner_seed_sealed_kbs_path: String,
     pub owner_seed_handoff_slots: Vec<String>,
+    pub enclava_init_unlock_socket: String,
     pub ownership_challenge_ttl_seconds: f64,
     // Kubernetes-secret backend fields (used when owner_ciphertext_backend = "kubernetes-secret")
     pub k8s_api_url: String,
@@ -160,6 +161,7 @@ impl Config {
                 })
             },
             owner_seed_handoff_slots: env_handoff_slots(),
+            enclava_init_unlock_socket: env_or("ENCLAVA_INIT_UNLOCK_SOCKET", ""),
             ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
             k8s_ca_cert_path: env_or(
@@ -222,6 +224,7 @@ impl Config {
             owner_seed_encrypted_kbs_path: "".into(),
             owner_seed_sealed_kbs_path: "".into(),
             owner_seed_handoff_slots: vec!["app-data".into(), "tls-data".into()],
+            enclava_init_unlock_socket: "".into(),
             ownership_challenge_ttl_seconds: 300.0,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
@@ -279,6 +282,7 @@ mod tests {
         "STORAGE_OWNERSHIP_MODE",
         "INSTANCE_ID",
         "OWNER_SEED_HANDOFF_SLOTS",
+        "ENCLAVA_INIT_UNLOCK_SOCKET",
         "HOSTNAME",
         "CAP_API_SIGNING_PUBKEY",
         "CAP_API_URL",
@@ -338,6 +342,7 @@ mod tests {
             config.owner_seed_handoff_slots,
             vec!["app-data", "tls-data"]
         );
+        assert_eq!(config.enclava_init_unlock_socket, "");
     }
 
     #[test]
@@ -436,5 +441,18 @@ mod tests {
         std::env::set_var("OWNER_SEED_HANDOFF_SLOTS", "unknown,tls-data");
         let config = Config::from_env();
         assert_eq!(config.owner_seed_handoff_slots, vec!["tls-data"]);
+    }
+
+    #[test]
+    fn test_enclava_init_unlock_socket_from_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var("ENCLAVA_INIT_UNLOCK_SOCKET", "/run/enclava/unlock.sock");
+        let config = Config::from_env();
+        assert_eq!(
+            config.enclava_init_unlock_socket,
+            "/run/enclava/unlock.sock"
+        );
     }
 }
