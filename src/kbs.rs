@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
-use crate::attestation::fetch_kbs_bearer_token;
+use crate::attestation::{fetch_kbs_bearer_token, fetch_kbs_bearer_token_with_runtime_data};
 use crate::ownership::{utc_now, OwnershipError};
 use crate::receipts::{ReceiptType, SignReceiptRequest};
 
@@ -314,6 +314,32 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn decode_hex_32(value: &str) -> Result<[u8; 32], OwnershipError> {
+    if value.len() != 64 {
+        return Err(OwnershipError::Store(
+            "receipt_pubkey_sha256_invalid_length".to_string(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| OwnershipError::Store("receipt_pubkey_sha256_invalid".to_string()))?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| OwnershipError::Store("receipt_pubkey_sha256_invalid".to_string()))?;
+        out[index] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn sign_workload_receipt(
     state: &crate::AppState,
     receipt_type: ReceiptType,
@@ -342,6 +368,75 @@ fn sign_workload_receipt(
     Ok(envelope)
 }
 
+fn receipt_bound_report_data(envelope: &Value) -> Result<[u8; 64], OwnershipError> {
+    let pubkey_sha256 = envelope
+        .pointer("/receipt/pubkey_sha256")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| OwnershipError::Store("receipt_pubkey_sha256_missing".to_string()))?;
+    let pubkey_sha256 = decode_hex_32(pubkey_sha256)?;
+    let mut report_data = [0u8; 64];
+    report_data[32..].copy_from_slice(&pubkey_sha256);
+    Ok(report_data)
+}
+
+fn receipt_attestation_runtime_data(envelope: &Value) -> Result<String, OwnershipError> {
+    let pubkey_sha256 = envelope
+        .pointer("/receipt/pubkey_sha256")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| OwnershipError::Store("receipt_pubkey_sha256_missing".to_string()))?;
+    decode_hex_32(pubkey_sha256)?;
+    Ok(pubkey_sha256.to_ascii_lowercase())
+}
+
+fn receipt_attestation_tee(profile: &str) -> &'static str {
+    let profile = profile.to_ascii_lowercase();
+    if profile.contains("snp") {
+        "snp"
+    } else if profile.contains("tdx") {
+        "tdx"
+    } else if profile.contains("sgx") {
+        "sgx"
+    } else {
+        "snp"
+    }
+}
+
+async fn attach_receipt_attestation(
+    state: &crate::AppState,
+    envelope: &mut Value,
+) -> Result<(), OwnershipError> {
+    let runtime_data = receipt_attestation_runtime_data(envelope)?;
+    let evidence_url = format!(
+        "{}?runtime_data={runtime_data}",
+        state.config.aa_evidence_url
+    );
+    let response = state
+        .http_client
+        .get(&evidence_url)
+        .header("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|err| OwnershipError::Store(format!("receipt_attestation_fetch_failed:{err}")))?;
+    let status = response.status();
+    let evidence: Value = response.json().await.map_err(|err| {
+        OwnershipError::Store(format!("receipt_attestation_decode_failed:{status}:{err}"))
+    })?;
+    if !status.is_success() {
+        return Err(OwnershipError::Store(format!(
+            "receipt_attestation_non_200:{}:{}",
+            status.as_u16(),
+            evidence
+        )));
+    }
+    envelope["receipt_attestation"] = json!({
+        "tee": receipt_attestation_tee(&state.config.attestation_profile),
+        "runtime_data": runtime_data,
+        "evidence": evidence,
+    });
+    Ok(())
+}
+
 /// Write ciphertext to KBS via the workload-resource endpoint.
 /// Uses PUT /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
 pub async fn put_kbs_workload_resource(
@@ -350,7 +445,10 @@ pub async fn put_kbs_workload_resource(
     body: &[u8],
     mode: WorkloadResourceWriteMode,
 ) -> Result<(), OwnershipError> {
-    let token = fetch_kbs_bearer_token(state)
+    let mut envelope = sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
+    attach_receipt_attestation(state, &mut envelope).await?;
+    let report_data = receipt_bound_report_data(&envelope)?;
+    let token = fetch_kbs_bearer_token_with_runtime_data(state, &report_data)
         .await
         .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
 
@@ -365,16 +463,8 @@ pub async fn put_kbs_workload_resource(
         .header("Authorization", format!("Bearer {token}"))
         .timeout(std::time::Duration::from_secs(20));
     let request = match mode {
-        WorkloadResourceWriteMode::Create => {
-            let envelope =
-                sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
-            request.header("If-None-Match", "*").json(&envelope)
-        }
-        WorkloadResourceWriteMode::Replace => {
-            let envelope =
-                sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
-            request.header("If-Match", "*").json(&envelope)
-        }
+        WorkloadResourceWriteMode::Create => request.header("If-None-Match", "*").json(&envelope),
+        WorkloadResourceWriteMode::Replace => request.header("If-Match", "*").json(&envelope),
     };
 
     let response = request
@@ -400,7 +490,10 @@ pub async fn delete_kbs_workload_resource(
     state: &crate::AppState,
     resource_path: &str,
 ) -> Result<(), OwnershipError> {
-    let token = fetch_kbs_bearer_token(state)
+    let mut envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
+    attach_receipt_attestation(state, &mut envelope).await?;
+    let report_data = receipt_bound_report_data(&envelope)?;
+    let token = fetch_kbs_bearer_token_with_runtime_data(state, &report_data)
         .await
         .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
 
@@ -408,8 +501,6 @@ pub async fn delete_kbs_workload_resource(
         "{}/{resource_path}",
         workload_resource_base(&state.config.kbs_resource_url)
     );
-
-    let envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
 
     let response = state
         .http_client
@@ -491,6 +582,36 @@ mod tests {
         assert_eq!(
             derived,
             "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/workload-resource/default/test-owner/seed-sealed"
+        );
+    }
+
+    #[test]
+    fn receipt_bound_report_data_is_receipt_pubkey_hash_hex() {
+        let pubkey_hash = [0x42u8; 32];
+        let envelope = json!({
+            "receipt": {
+                "pubkey_sha256": hex_lower(&pubkey_hash),
+            }
+        });
+
+        let report_data = receipt_bound_report_data(&envelope).unwrap();
+
+        assert_eq!(&report_data[..32], &[0u8; 32]);
+        assert_eq!(&report_data[32..], &pubkey_hash);
+    }
+
+    #[test]
+    fn receipt_attestation_runtime_data_is_receipt_pubkey_hash_hex() {
+        let pubkey_hash = [0x42u8; 32];
+        let envelope = json!({
+            "receipt": {
+                "pubkey_sha256": hex_lower(&pubkey_hash),
+            }
+        });
+
+        assert_eq!(
+            receipt_attestation_runtime_data(&envelope).unwrap(),
+            hex_lower(&pubkey_hash)
         );
     }
 

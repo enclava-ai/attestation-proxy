@@ -238,12 +238,41 @@ pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, 
     let attempts = state.config.aa_token_fetch_attempts.max(1);
     let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
     let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
+    let (payload, error) = fetch_aa_token_payload_from_url(
+        state,
+        &state.config.aa_token_url,
+        attempts,
+        timeout,
+        retry_sleep,
+    )
+    .await;
+    if let Some(payload) = payload {
+        cache.store_payload(payload.clone(), &state.config);
+        return (Some(payload), None);
+    }
+    if let Some(error) = error {
+        cache.store_error(error.clone(), &state.config);
+        return (None, Some(error));
+    }
+
+    let error = "aa_token_invalid_response".to_string();
+    cache.store_error(error.clone(), &state.config);
+    (None, Some(error))
+}
+
+async fn fetch_aa_token_payload_from_url(
+    state: &crate::AppState,
+    url: &str,
+    attempts: u32,
+    timeout: Duration,
+    retry_sleep: Duration,
+) -> (Option<Value>, Option<String>) {
     let mut last_error = String::new();
 
     for attempt in 1..=attempts {
         let result = state
             .http_client
-            .get(&state.config.aa_token_url)
+            .get(url)
             .header("Accept", "application/json")
             .timeout(timeout)
             .send()
@@ -262,14 +291,10 @@ pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, 
                             .unwrap_or(false);
 
                         if has_token {
-                            cache.store_payload(payload.clone(), &state.config);
+                            return (Some(payload), None);
                         } else {
-                            cache.store_error(
-                                "aa_token_invalid_response".to_string(),
-                                &state.config,
-                            );
+                            return (None, Some("aa_token_invalid_response".to_string()));
                         }
-                        return (Some(payload), None);
                     }
                     Err(e) => {
                         last_error = e.to_string();
@@ -287,13 +312,46 @@ pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, 
     }
 
     let error = format!("aa_token_fetch_failed:{last_error}");
-    cache.store_error(error.clone(), &state.config);
     (None, Some(error))
 }
 
 /// Fetch a bearer token string for KBS requests.
 pub async fn fetch_kbs_bearer_token(state: &crate::AppState) -> Result<String, String> {
     let (payload, error) = fetch_aa_token_payload(state).await;
+    if let Some(e) = error {
+        return Err(e);
+    }
+    let payload = payload.ok_or("aa_token_invalid_response")?;
+    let token = payload
+        .as_object()
+        .and_then(|o| o.get("token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("aa_token_missing")?;
+    Ok(token.to_string())
+}
+
+pub fn kbs_token_url_for_runtime_data(base_url: &str, runtime_data: &[u8; 64]) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    let encoded = URL_SAFE_NO_PAD.encode(runtime_data);
+    format!("{base_url}{separator}runtime_data={encoded}")
+}
+
+/// Fetch a bearer token whose AA evidence report_data is bound to runtime_data.
+///
+/// This intentionally bypasses the generic token cache: workload-resource
+/// mutations need a fresh token bound to the receipt public key used for that
+/// mutation, not a reusable KBS read token.
+pub async fn fetch_kbs_bearer_token_with_runtime_data(
+    state: &crate::AppState,
+    runtime_data: &[u8; 64],
+) -> Result<String, String> {
+    let url = kbs_token_url_for_runtime_data(&state.config.aa_token_url, runtime_data);
+    let attempts = state.config.aa_token_fetch_attempts.max(1);
+    let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
+    let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
+    let (payload, error) =
+        fetch_aa_token_payload_from_url(state, &url, attempts, timeout, retry_sleep).await;
     if let Some(e) = error {
         return Err(e);
     }
@@ -969,6 +1027,22 @@ mod tests {
         // None claims
         let ttl4 = token_cache_ttl_seconds(&None, &config);
         assert!((ttl4 - config.aa_token_cache_seconds).abs() < 0.01);
+    }
+
+    #[test]
+    fn kbs_token_url_for_runtime_data_preserves_existing_query() {
+        let mut report_data = [0u8; 64];
+        report_data[32..].copy_from_slice(&[0x42; 32]);
+
+        let url = super::kbs_token_url_for_runtime_data(
+            "http://127.0.0.1:8006/aa/token?token_type=kbs",
+            &report_data,
+        );
+
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8006/aa/token?token_type=kbs&runtime_data=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"
+        );
     }
 
     #[test]

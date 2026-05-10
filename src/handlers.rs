@@ -973,9 +973,9 @@ pub async fn attestation(
         &receipt_pubkey_sha256,
     );
     // Fetch evidence from AA agent
-    let encoded_runtime_data =
-        percent_encoding::percent_encode(&report_data, percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
+    let encoded_runtime_data = std::str::from_utf8(&report_data)
+        .expect("report data is hex ASCII")
+        .to_string();
     let evidence_url = format!(
         "{}?runtime_data={}",
         state.config.aa_evidence_url, encoded_runtime_data
@@ -1334,11 +1334,15 @@ pub async fn unlock(
         );
     }
 
-    if state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode() {
-        unlock_password_mode(&state, &mut password).await
-    } else {
-        unlock_level1_mode(&state, &mut password)
-    }
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        if task_state.ownership.is_password_mode() || task_state.ownership.is_auto_unlock_mode() {
+            let _ = unlock_password_mode(&task_state, &mut password).await;
+        } else {
+            let _ = unlock_level1_mode(&task_state, &mut password);
+        }
+    });
+    json_response(202, &json!({"state": "unlocking"}))
 }
 
 fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Response {
@@ -2518,6 +2522,17 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio::time::{sleep, Duration};
 
+    async fn wait_for_ownership_state(state: &AppState, expected: &str) -> Value {
+        for _ in 0..200 {
+            let body = state.ownership.state_json();
+            if body.get("state").and_then(Value::as_str) == Some(expected) {
+                return body;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        state.ownership.state_json()
+    }
+
     #[test]
     fn missing_owner_seed_resource_accepts_only_404() {
         assert!(is_missing_owner_seed_resource(
@@ -2596,13 +2611,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let captured = api_server.aa_evidence_runtime_data();
         assert_eq!(captured.len(), 1, "expected one AA evidence request");
-        let forwarded = captured[0].as_bytes();
-        assert_eq!(forwarded.len(), 64);
-        assert!(forwarded.iter().all(u8::is_ascii_hexdigit));
 
         let receipt_pubkey_sha256 = state.receipt_signer.public_key_sha256();
         let expected = build_report_data(domain, &nonce, &leaf_spki_sha256, &receipt_pubkey_sha256);
-        assert_eq!(forwarded, expected.as_slice());
+        assert_eq!(captured[0], std::str::from_utf8(&expected).unwrap());
+        let forwarded = expected.as_slice();
         let expected_transcript = crate::receipts::ce_v1_hash(&[
             ("purpose", b"enclava-tee-tls-v1"),
             ("domain", domain.as_bytes()),
@@ -2821,8 +2834,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
         assert_eq!(
             state
                 .ownership
@@ -2993,8 +3008,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
         assert!(
             signal_dir
                 .path
@@ -3045,8 +3062,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
         assert!(
             signal_dir
                 .path
@@ -3109,9 +3128,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(read_json(response).await, json!({ "state": "unlocked" }));
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
         let request_line = socket_task.await.expect("socket task");
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
         assert_eq!(
             request_line.trim_end(),
             format!(
@@ -3176,11 +3197,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 500);
-        let body = read_json(response).await;
-        assert_eq!(body["error"], "unlock_failed");
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "error").await;
         assert_eq!(body["state"], "error");
-        assert!(body["detail"]
+        assert!(body["error"]
             .as_str()
             .unwrap()
             .contains("enclava_init_failed:opening state volume /dev/csi0"));
@@ -3215,11 +3236,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(
-            read_json(response).await,
-            json!({ "error": "wrong_password", "state": "locked" })
-        );
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "locked").await;
+        assert_eq!(body["state"], "locked");
+        assert_eq!(body["error"], serde_json::Value::Null);
         assert!(
             !signal_dir
                 .path
@@ -3263,22 +3284,18 @@ mod tests {
         .expect("write slot error");
 
         let response = unlock(
-            State(state),
+            State(state.clone()),
             Json(UnlockRequest {
                 password: Zeroizing::new("correct-password".to_string()),
             }),
         )
         .await;
 
-        assert_eq!(response.status().as_u16(), 500);
-        assert_eq!(
-            read_json(response).await,
-            json!({
-                "error": "unlock_failed",
-                "detail": "app-data_unlock_failed:mount_failed",
-                "state": "error"
-            })
-        );
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&state, "error").await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["error"], "storage_error: app-data_unlock_failed:mount_failed");
     }
 
     #[tokio::test]
