@@ -2865,21 +2865,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(wrong_password.status().as_u16(), 200);
+        assert_eq!(wrong_password.status().as_u16(), 202);
         assert_eq!(
             read_json(wrong_password).await,
-            json!({ "error": "wrong_password", "state": "locked" })
+            json!({ "state": "unlocking" })
         );
+        let body = wait_for_ownership_state(&wrong_state, "locked").await;
+        assert_eq!(body["state"], "locked");
+        assert_eq!(body["error"], serde_json::Value::Null);
         assert!(!wrong_signal_dir.path.join(SIGNAL_KEY_FILE).exists());
         assert!(!wrong_signal_dir.path.join(SIGNAL_ERROR_FILE).exists());
-        assert_eq!(
-            wrong_state
-                .ownership
-                .state_json()
-                .get("state")
-                .and_then(Value::as_str),
-            Some("locked")
-        );
 
         let fatal_signal_dir = test_signal_dir("unlock-error-paths-fatal");
         let fatal_state = build_state(&fatal_signal_dir.path);
@@ -2895,19 +2890,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(fatal.status().as_u16(), 500);
-        assert_eq!(
-            read_json(fatal).await,
-            json!({ "error": "unlock_failed", "detail": "format_failed", "state": "error" })
-        );
-        assert_eq!(
-            fatal_state
-                .ownership
-                .state_json()
-                .get("state")
-                .and_then(Value::as_str),
-            Some("error")
-        );
+        assert_eq!(fatal.status().as_u16(), 202);
+        assert_eq!(read_json(fatal).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&fatal_state, "error").await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["error"], "format_failed");
 
         let timeout_signal_dir = test_signal_dir("unlock-error-paths-timeout");
         let timeout_state = build_state(&timeout_signal_dir.path);
@@ -2918,19 +2905,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(timeout.status().as_u16(), 500);
-        assert_eq!(
-            read_json(timeout).await,
-            json!({ "error": "unlock_timeout", "state": "error" })
-        );
-        assert_eq!(
-            timeout_state
-                .ownership
-                .state_json()
-                .get("state")
-                .and_then(Value::as_str),
-            Some("error")
-        );
+        assert_eq!(timeout.status().as_u16(), 202);
+        assert_eq!(read_json(timeout).await, json!({ "state": "unlocking" }));
+        let body = wait_for_ownership_state(&timeout_state, "error").await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["error"], "unlock_timeout");
 
         let rate_signal_dir = test_signal_dir("unlock-error-paths-rate-limit");
         let rate_state = build_state(&rate_signal_dir.path);
@@ -2947,11 +2926,11 @@ mod tests {
                 }),
             )
             .await;
-            assert_eq!(retry.status().as_u16(), 200);
-            assert_eq!(
-                read_json(retry).await,
-                json!({ "error": "wrong_password", "state": "locked" })
-            );
+            assert_eq!(retry.status().as_u16(), 202);
+            assert_eq!(read_json(retry).await, json!({ "state": "unlocking" }));
+            let body = wait_for_ownership_state(&rate_state, "locked").await;
+            assert_eq!(body["state"], "locked");
+            assert_eq!(body["error"], serde_json::Value::Null);
         }
 
         let rate_limited = unlock(
@@ -3295,7 +3274,10 @@ mod tests {
         assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
         let body = wait_for_ownership_state(&state, "error").await;
         assert_eq!(body["state"], "error");
-        assert_eq!(body["error"], "storage_error: app-data_unlock_failed:mount_failed");
+        assert_eq!(
+            body["error"],
+            "storage_error: app-data_unlock_failed:mount_failed"
+        );
     }
 
     #[tokio::test]
